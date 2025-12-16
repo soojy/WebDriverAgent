@@ -14,6 +14,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface FBCustomCommands : NSObject <FBCommandHandler>
 
++ (id<FBResponsePayload>)handleMediaImport:(FBRouteRequest *)request;
++ (id<FBResponsePayload>)handleMediaPop:(FBRouteRequest *)request;
+
 @end
 
 NS_ASSUME_NONNULL_END

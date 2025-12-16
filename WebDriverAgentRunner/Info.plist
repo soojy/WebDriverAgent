@@ -26,5 +26,9 @@
 	<string></string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string></string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>WebDriverAgent needs access to your photo library to enable media import and automation functionality for photo management tasks. This allows automated testing and management of photos through media endpoints.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>WebDriverAgent needs permission to add photos to your library for automated testing and media management. This enables the automation of photo organization and storage tasks.</string>
 </dict>
 </plist>

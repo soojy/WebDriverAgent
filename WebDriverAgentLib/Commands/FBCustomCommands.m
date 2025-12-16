@@ -10,6 +10,9 @@
 
 #import <XCTest/XCUIDevice.h>
 #import <CoreLocation/CoreLocation.h>
+#if !TARGET_OS_TV
+#import <Photos/Photos.h>
+#endif
 
 #import "FBConfiguration.h"
 #import "FBKeyboard.h"
@@ -74,6 +77,10 @@
 #if __clang_major__ >= 15
     [[FBRoute POST:@"/wda/element/:uuid/keyboardInput"] respondWithTarget:self action:@selector(handleKeyboardInput:)],
 #endif
+    [[FBRoute POST:@"/wda/media/import"] respondWithTarget:self action:@selector(handleMediaImport:)],
+    [[FBRoute POST:@"/wda/media/import"].withoutSession respondWithTarget:self action:@selector(handleMediaImport:)],
+    [[FBRoute POST:@"/wda/media/pop"] respondWithTarget:self action:@selector(handleMediaPop:)],
+    [[FBRoute POST:@"/wda/media/pop"].withoutSession respondWithTarget:self action:@selector(handleMediaPop:)],
     [[FBRoute GET:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleGetSimulatedLocation:)],
     [[FBRoute GET:@"/wda/simulatedLocation"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedLocation:)],
     [[FBRoute POST:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleSetSimulatedLocation:)],
@@ -609,6 +616,170 @@
   return FBResponseWithOK();
 }
 #endif
+
++ (id<FBResponsePayload>)handleMediaImport:(FBRouteRequest *)request
+{
+  NSString *albumName = request.arguments[@"album"] ?: @"TT_MEDIA";
+  NSString *filename = request.arguments[@"filename"];
+  NSString *dataBase64 = request.arguments[@"dataBase64"];
+  NSNumber *creationTimestampMs = request.arguments[@"creationTimestampMs"];
+  
+  if (nil == dataBase64) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'dataBase64' argument is required"
+                                                                       traceback:nil]);
+  }
+  
+  NSData *imageData = [[NSData alloc] initWithBase64EncodedString:dataBase64 options:0];
+  if (nil == imageData) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot decode base64 image data"
+                                                                       traceback:nil]);
+  }
+  
+  UIImage *image = [UIImage imageWithData:imageData];
+  if (nil == image) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot create image from provided data"
+                                                                       traceback:nil]);
+  }
+  
+  __block NSError *blockError = nil;
+  __block NSString *assetLocalIdentifier = nil;
+  
+  // Request authorization if needed
+  PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
+  if (status == PHAuthorizationStatusNotDetermined) {
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus newStatus) {
+      dispatch_semaphore_signal(sema);
+    }];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    status = [PHPhotoLibrary authorizationStatus];
+  }
+  
+  if (status != PHAuthorizationStatusAuthorized) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Photo library access not authorized"
+                                                               traceback:nil]);
+  }
+  
+  // Create the asset
+  [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+    PHAssetCreationRequest *creationRequest = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
+    if (creationTimestampMs != nil) {
+      NSDate *creationDate = [NSDate dateWithTimeIntervalSince1970:(creationTimestampMs.doubleValue / 1000.0)];
+      creationRequest.creationDate = creationDate;
+    }
+    assetLocalIdentifier = creationRequest.placeholderForCreatedAsset.localIdentifier;
+  } error:&blockError];
+  
+  if (blockError != nil) {
+    return FBResponseWithUnknownError(blockError);
+  }
+  
+  // Find or create album and add asset
+  __block PHAssetCollection *album = nil;
+  PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+  fetchOptions.predicate = [NSPredicate predicateWithFormat:@"title = %@", albumName];
+  PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                                                             subtype:PHAssetCollectionSubtypeAny
+                                                                                             options:fetchOptions];
+  album = collections.firstObject;
+  
+  if (nil == album) {
+    // Create the album
+    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+      [PHAssetCollectionChangeRequest creationRequestForAssetCollectionWithTitle:albumName];
+    } error:&blockError];
+    
+    if (blockError != nil) {
+      return FBResponseWithUnknownError(blockError);
+    }
+    
+    collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                           subtype:PHAssetCollectionSubtypeAny
+                                                           options:fetchOptions];
+    album = collections.firstObject;
+  }
+  
+  if (nil == album) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to create or find album"
+                                                               traceback:nil]);
+  }
+  
+  // Add asset to album
+  PHFetchResult<PHAsset *> *assets = [PHAsset fetchAssetsWithLocalIdentifiers:@[assetLocalIdentifier] options:nil];
+  PHAsset *asset = assets.firstObject;
+  
+  if (nil == asset) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to fetch created asset"
+                                                               traceback:nil]);
+  }
+  
+  [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+    PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
+    [albumChangeRequest addAssets:@[asset]];
+  } error:&blockError];
+  
+  if (blockError != nil) {
+    return FBResponseWithUnknownError(blockError);
+  }
+  
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleMediaPop:(FBRouteRequest *)request
+{
+  NSString *albumName = request.arguments[@"album"] ?: @"TT_MEDIA";
+  NSNumber *count = request.arguments[@"count"] ?: @1;
+  
+  if (count.integerValue < 1) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'count' must be at least 1"
+                                                                       traceback:nil]);
+  }
+  
+  PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
+  if (status != PHAuthorizationStatusAuthorized) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Photo library access not authorized"
+                                                               traceback:nil]);
+  }
+  
+  PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+  fetchOptions.predicate = [NSPredicate predicateWithFormat:@"title = %@", albumName];
+  PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                                                             subtype:PHAssetCollectionSubtypeAny
+                                                                                             options:fetchOptions];
+  PHAssetCollection *album = collections.firstObject;
+  
+  if (nil == album) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:[NSString stringWithFormat:@"Album '%@' not found", albumName]
+                                                                       traceback:nil]);
+  }
+  
+  // Fetch assets sorted by creation date (oldest first)
+  PHFetchOptions *assetFetchOptions = [[PHFetchOptions alloc] init];
+  assetFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:YES]];
+  PHFetchResult<PHAsset *> *assets = [PHAsset fetchAssetsInAssetCollection:album options:assetFetchOptions];
+  
+  NSInteger actualCount = MIN(count.integerValue, (NSInteger)assets.count);
+  if (actualCount == 0) {
+    return FBResponseWithOK();
+  }
+  
+  NSMutableArray<PHAsset *> *assetsToRemove = [NSMutableArray arrayWithCapacity:actualCount];
+  for (NSInteger i = 0; i < actualCount; i++) {
+    [assetsToRemove addObject:[assets objectAtIndex:i]];
+  }
+  
+  __block NSError *blockError = nil;
+  [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+    PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
+    [albumChangeRequest removeAssets:assetsToRemove];
+  } error:&blockError];
+  
+  if (blockError != nil) {
+    return FBResponseWithUnknownError(blockError);
+  }
+  
+  return FBResponseWithOK();
+}
 #endif
 
 + (id<FBResponsePayload>)handlePerformAccessibilityAudit:(FBRouteRequest *)request
