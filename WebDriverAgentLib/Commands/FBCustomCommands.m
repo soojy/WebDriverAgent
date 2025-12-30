@@ -617,14 +617,19 @@
 }
 #endif
 
-// --------------------------------------------------------------------------
-// MODIFIED MEDIA HANDLER - IMPORT (DIRECT TO RECENTS)
-// --------------------------------------------------------------------------
+/**
+ * Import media to photo library.
+ * If 'album' is provided and non-empty, the asset is also added to that album.
+ * If 'album' is nil or empty, the asset is only added to the library (appears in Recents automatically).
+ */
 + (id<FBResponsePayload>)handleMediaImport:(FBRouteRequest *)request
 {
-  // Note: We ignore albumName here to insert directly into Recents
+  NSString *albumName = request.arguments[@"album"];
   NSString *dataBase64 = request.arguments[@"dataBase64"];
   NSNumber *creationTimestampMs = request.arguments[@"creationTimestampMs"];
+  
+  // Check if album should be used (non-nil and non-empty)
+  BOOL useAlbum = (albumName != nil && albumName.length > 0);
   
   if (nil == dataBase64) {
     return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'dataBase64' argument is required"
@@ -644,7 +649,9 @@
   }
   
   __block NSError *blockError = nil;
+  __block NSString *assetLocalIdentifier = nil;
   
+  // Request authorization if needed
   PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
   if (status == PHAuthorizationStatusNotDetermined) {
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
@@ -660,29 +667,85 @@
                                                                traceback:nil]);
   }
   
-  // Creates asset in default "Camera Roll" (Recents)
+  // Create the asset - it will automatically appear in Recents/All Photos
   [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
     PHAssetCreationRequest *creationRequest = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
     if (creationTimestampMs != nil) {
       NSDate *creationDate = [NSDate dateWithTimeIntervalSince1970:(creationTimestampMs.doubleValue / 1000.0)];
       creationRequest.creationDate = creationDate;
     }
+    assetLocalIdentifier = creationRequest.placeholderForCreatedAsset.localIdentifier;
   } error:&blockError];
   
   if (blockError != nil) {
     return FBResponseWithUnknownError(blockError);
   }
   
+  // Only add to album if albumName is provided and not empty
+  if (useAlbum) {
+    __block PHAssetCollection *album = nil;
+    PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+    fetchOptions.predicate = [NSPredicate predicateWithFormat:@"title = %@", albumName];
+    PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                                                               subtype:PHAssetCollectionSubtypeAny
+                                                                                               options:fetchOptions];
+    album = collections.firstObject;
+    
+    if (nil == album) {
+      // Create the album
+      [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+        [PHAssetCollectionChangeRequest creationRequestForAssetCollectionWithTitle:albumName];
+      } error:&blockError];
+      
+      if (blockError != nil) {
+        return FBResponseWithUnknownError(blockError);
+      }
+      
+      collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                             subtype:PHAssetCollectionSubtypeAny
+                                                             options:fetchOptions];
+      album = collections.firstObject;
+    }
+    
+    if (nil == album) {
+      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to create or find album"
+                                                                 traceback:nil]);
+    }
+    
+    // Add asset to album
+    PHFetchResult<PHAsset *> *assets = [PHAsset fetchAssetsWithLocalIdentifiers:@[assetLocalIdentifier] options:nil];
+    PHAsset *asset = assets.firstObject;
+    
+    if (nil == asset) {
+      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to fetch created asset"
+                                                                 traceback:nil]);
+    }
+    
+    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+      PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
+      [albumChangeRequest addAssets:@[asset]];
+    } error:&blockError];
+    
+    if (blockError != nil) {
+      return FBResponseWithUnknownError(blockError);
+    }
+  }
+  
   return FBResponseWithOK();
 }
 
-// --------------------------------------------------------------------------
-// MODIFIED MEDIA HANDLER - POP (CLEAN FROM RECENTS)
-// --------------------------------------------------------------------------
+/**
+ * Delete media from photo library.
+ * If 'album' is provided and non-empty, removes assets from that specific album only.
+ * If 'album' is nil or empty, DELETES assets from the entire photo library.
+ */
 + (id<FBResponsePayload>)handleMediaPop:(FBRouteRequest *)request
 {
-  // Note: We ignore album name and target "Recents" to clean device
+  NSString *albumName = request.arguments[@"album"];
   NSNumber *count = request.arguments[@"count"] ?: @1;
+  
+  // Check if we should delete from entire library (no album specified)
+  BOOL deleteFromLibrary = (albumName == nil || albumName.length == 0);
   
   if (count.integerValue < 1) {
     return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'count' must be at least 1"
@@ -695,37 +758,57 @@
                                                                traceback:nil]);
   }
   
-  // Target Smart Album: User Library (Recents/Camera Roll)
-  PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeSmartAlbum
-                                                                                             subtype:PHAssetCollectionSubtypeSmartAlbumUserLibrary
-                                                                                             options:nil];
-  PHAssetCollection *album = collections.firstObject;
+  PHFetchResult<PHAsset *> *assets = nil;
+  PHAssetCollection *album = nil;
   
-  if (nil == album) {
-    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"System 'Recents' album not found"
-                                                                       traceback:nil]);
+  if (deleteFromLibrary) {
+    // Fetch ALL assets from the entire photo library
+    PHFetchOptions *assetFetchOptions = [[PHFetchOptions alloc] init];
+    assetFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:YES]];
+    assets = [PHAsset fetchAssetsWithOptions:assetFetchOptions];
+  } else {
+    // Fetch from specific album
+    PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+    fetchOptions.predicate = [NSPredicate predicateWithFormat:@"title = %@", albumName];
+    PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                                                               subtype:PHAssetCollectionSubtypeAny
+                                                                                               options:fetchOptions];
+    album = collections.firstObject;
+    
+    if (nil == album) {
+      // Album doesn't exist, nothing to delete - return OK
+      return FBResponseWithOK();
+    }
+    
+    PHFetchOptions *assetFetchOptions = [[PHFetchOptions alloc] init];
+    assetFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:YES]];
+    assets = [PHAsset fetchAssetsInAssetCollection:album options:assetFetchOptions];
   }
-  
-  // Fetch assets sorted by creation date (oldest first to ensure full clean)
-  PHFetchOptions *assetFetchOptions = [[PHFetchOptions alloc] init];
-  assetFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:YES]];
-  PHFetchResult<PHAsset *> *assets = [PHAsset fetchAssetsInAssetCollection:album options:assetFetchOptions];
   
   NSInteger actualCount = MIN(count.integerValue, (NSInteger)assets.count);
   if (actualCount == 0) {
     return FBResponseWithOK();
   }
   
-  NSMutableArray<PHAsset *> *assetsToRemove = [NSMutableArray arrayWithCapacity:actualCount];
+  NSMutableArray<PHAsset *> *assetsToProcess = [NSMutableArray arrayWithCapacity:actualCount];
   for (NSInteger i = 0; i < actualCount; i++) {
-    [assetsToRemove addObject:[assets objectAtIndex:i]];
+    [assetsToProcess addObject:[assets objectAtIndex:i]];
   }
   
   __block NSError *blockError = nil;
-  [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
-    // HARD DELETE from device
-    [PHAssetChangeRequest deleteAssets:assetsToRemove];
-  } error:&blockError];
+  
+  if (deleteFromLibrary) {
+    // DELETE assets from library entirely (moves to Recently Deleted)
+    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+      [PHAssetChangeRequest deleteAssets:assetsToProcess];
+    } error:&blockError];
+  } else {
+    // Just remove from album (asset stays in library)
+    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+      PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
+      [albumChangeRequest removeAssets:assetsToProcess];
+    } error:&blockError];
+  }
   
   if (blockError != nil) {
     return FBResponseWithUnknownError(blockError);
