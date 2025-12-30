@@ -735,6 +735,106 @@
 }
 
 /**
+ * Helper method to find and tap the delete confirmation button in system alerts
+ */
++ (BOOL)handleDeleteConfirmationDialogWithTimeout:(NSTimeInterval)timeout
+{
+  XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
+  
+  // List of possible delete button labels (for different iOS versions and localizations)
+  NSArray<NSString *> *deleteButtonLabels = @[
+    @"Delete",
+    @"Delete Photo",
+    @"Delete Photos",
+    @"Delete Items",
+    @"Delete Item",
+    @"Delete Video",
+    @"Delete Videos",
+    @"Удалить",           // Russian
+    @"Supprimer",         // French
+    @"Löschen",           // German
+    @"Eliminar",          // Spanish
+    @"删除",              // Chinese Simplified
+    @"刪除",              // Chinese Traditional
+    @"削除",              // Japanese
+    @"삭제"               // Korean
+  ];
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    // First, try to find buttons directly in springboard
+    for (NSString *label in deleteButtonLabels) {
+      XCUIElement *deleteButton = springboard.buttons[label];
+      if (deleteButton.exists && deleteButton.isHittable) {
+        [deleteButton tap];
+        return YES;
+      }
+    }
+    
+    // Try to find buttons in alerts
+    XCUIElementQuery *alerts = springboard.alerts;
+    if (alerts.count > 0) {
+      XCUIElement *alert = [alerts elementBoundByIndex:0];
+      XCUIElementQuery *alertButtons = alert.buttons;
+      
+      for (NSUInteger i = 0; i < alertButtons.count; i++) {
+        XCUIElement *button = [alertButtons elementBoundByIndex:i];
+        NSString *buttonLabel = button.label;
+        
+        if (buttonLabel == nil) {
+          continue;
+        }
+        
+        // Check if it's a delete-related button
+        NSString *lowerLabel = [buttonLabel lowercaseString];
+        if ([lowerLabel containsString:@"delete"] ||
+            [lowerLabel containsString:@"remove"] ||
+            [lowerLabel containsString:@"удалить"] ||
+            [lowerLabel containsString:@"supprimer"] ||
+            [lowerLabel containsString:@"löschen"] ||
+            [lowerLabel containsString:@"eliminar"]) {
+          if (button.exists && button.isHittable) {
+            [button tap];
+            return YES;
+          }
+        }
+      }
+    }
+    
+    // Also check for sheets (action sheets)
+    XCUIElementQuery *sheets = springboard.sheets;
+    if (sheets.count > 0) {
+      XCUIElement *sheet = [sheets elementBoundByIndex:0];
+      XCUIElementQuery *sheetButtons = sheet.buttons;
+      
+      for (NSUInteger i = 0; i < sheetButtons.count; i++) {
+        XCUIElement *button = [sheetButtons elementBoundByIndex:i];
+        NSString *buttonLabel = button.label;
+        
+        if (buttonLabel == nil) {
+          continue;
+        }
+        
+        NSString *lowerLabel = [buttonLabel lowercaseString];
+        if ([lowerLabel containsString:@"delete"] ||
+            [lowerLabel containsString:@"remove"]) {
+          if (button.exists && button.isHittable) {
+            [button tap];
+            return YES;
+          }
+        }
+      }
+    }
+    
+    // Small delay before retrying
+    [NSThread sleepForTimeInterval:0.1];
+  }
+  
+  return NO;
+}
+
+/**
  * Delete media from photo library.
  * If 'album' is provided and non-empty, removes assets from that specific album only.
  * If 'album' is nil or empty, DELETES assets from the entire photo library.
@@ -799,11 +899,39 @@
   
   if (deleteFromLibrary) {
     // DELETE assets from library entirely (moves to Recently Deleted)
-    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+    // This triggers a system confirmation dialog that we need to handle
+    
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block BOOL operationCompleted = NO;
+    
+    // Start the delete operation asynchronously
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
       [PHAssetChangeRequest deleteAssets:assetsToProcess];
-    } error:&blockError];
+    } completionHandler:^(BOOL success, NSError *error) {
+      if (!success && error != nil) {
+        blockError = error;
+      }
+      operationCompleted = YES;
+      dispatch_semaphore_signal(semaphore);
+    }];
+    
+    // Handle the system confirmation dialog
+    // Give the dialog a moment to appear
+    [NSThread sleepForTimeInterval:0.5];
+    
+    // Try to find and tap the delete button
+    [self handleDeleteConfirmationDialogWithTimeout:5.0];
+    
+    // Wait for the delete operation to complete (with timeout)
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC);
+    dispatch_semaphore_wait(semaphore, timeout);
+    
+    if (!operationCompleted) {
+      return FBResponseWithStatus([FBCommandStatus timeoutErrorWithMessage:@"Delete operation timed out"
+                                                                 traceback:nil]);
+    }
   } else {
-    // Just remove from album (asset stays in library)
+    // Just remove from album (asset stays in library) - no confirmation needed
     [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
       PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
       [albumChangeRequest removeAssets:assetsToProcess];
