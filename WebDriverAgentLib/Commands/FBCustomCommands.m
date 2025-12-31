@@ -4,8 +4,6 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- *
- * Enhanced WDA with Script Execution, Vision Framework, and HTTP Streaming
  */
 
 #import "FBCustomCommands.h"
@@ -37,30 +35,16 @@
 #import "XCUIElement+FBIsVisible.h"
 #import "XCUIElementQuery.h"
 #import "FBUnattachedAppLauncher.h"
-#import "FBElementCache.h"
-
-#pragma mark - Stream Writer Protocol
-
-@protocol FBStreamWriter <NSObject>
-- (void)writeEvent:(NSDictionary *)event;
-- (void)close;
-@end
 
 #pragma mark - Script Executor
 
 @interface FBScriptExecutor : NSObject
 
-@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *results;
-@property (nonatomic, strong) NSMutableDictionary<NSString *, id> *variables;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *results;
 @property (nonatomic, strong) XCUIApplication *currentApp;
 @property (nonatomic, strong) XCUIApplication *springboard;
-@property (nonatomic, weak) id<FBStreamWriter> streamWriter;
-@property (nonatomic, assign) BOOL shouldBreak;
-@property (nonatomic, assign) BOOL shouldContinue;
-@property (nonatomic, strong) NSMutableArray<NSDictionary *> *elementCache;
 
 - (NSDictionary *)executeSteps:(NSArray<NSDictionary *> *)steps;
-- (NSString *)substituteVariables:(NSString *)input;
 
 @end
 
@@ -71,179 +55,45 @@
   self = [super init];
   if (self) {
     _results = [NSMutableDictionary dictionary];
-    _variables = [NSMutableDictionary dictionary];
     _springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
-    _elementCache = [NSMutableArray array];
-    _shouldBreak = NO;
-    _shouldContinue = NO;
   }
   return self;
 }
 
-- (void)emitEvent:(NSString *)type data:(NSDictionary *)data
-{
-  if (self.streamWriter) {
-    NSMutableDictionary *event = [NSMutableDictionary dictionaryWithDictionary:data];
-    event[@"type"] = type;
-    event[@"timestamp"] = @([[NSDate date] timeIntervalSince1970] * 1000);
-    [self.streamWriter writeEvent:event];
-  }
-}
-
-- (void)log:(NSString *)message level:(NSString *)level
-{
-  [self emitEvent:@"log" data:@{@"message": message, @"level": level}];
-}
-
 - (NSDictionary *)executeSteps:(NSArray<NSDictionary *> *)steps
 {
-  NSDate *startTime = [NSDate date];
-  
-  [self emitEvent:@"start" data:@{@"totalSteps": @(steps.count)}];
-  
   for (NSUInteger i = 0; i < steps.count; i++) {
-    if (self.shouldBreak) {
-      self.shouldBreak = NO;
-      break;
-    }
-    
-    if (self.shouldContinue) {
-      self.shouldContinue = NO;
-      continue;
-    }
-    
     NSDictionary *step = steps[i];
-    NSString *action = step[@"action"] ?: @"unknown";
-    NSString *stepId = step[@"id"] ?: [NSString stringWithFormat:@"step_%lu", (unsigned long)i];
-    
-    [self emitEvent:@"step" data:@{
-      @"index": @(i),
-      @"action": action,
-      @"status": @"started",
-      @"stepId": stepId
-    }];
-    
     NSError *error = nil;
-    NSDate *stepStart = [NSDate date];
+    
     BOOL success = [self executeStep:step error:&error];
-    NSTimeInterval stepDuration = [[NSDate date] timeIntervalSinceDate:stepStart];
     
     if (!success) {
       NSNumber *optional = step[@"optional"];
-      
-      [self emitEvent:@"step" data:@{
-        @"index": @(i),
-        @"action": action,
-        @"status": @"failed",
-        @"stepId": stepId,
-        @"error": error.localizedDescription ?: @"Unknown error",
-        @"duration": @(stepDuration * 1000)
-      }];
-      
       if (optional && optional.boolValue) {
-        [self log:[NSString stringWithFormat:@"Optional step '%@' failed, continuing", action] level:@"warn"];
         continue;
       }
       
-      NSTimeInterval totalDuration = [[NSDate date] timeIntervalSinceDate:startTime];
-      
-      NSDictionary *result = @{
+      return @{
         @"success": @NO,
         @"results": self.results,
-        @"variables": self.variables,
         @"stoppedAt": @(i),
         @"error": error.localizedDescription ?: @"Unknown error",
-        @"failedAction": action,
-        @"failedStepId": stepId,
-        @"duration": @(totalDuration * 1000)
+        @"failedAction": step[@"action"] ?: @"unknown"
       };
-      
-      [self emitEvent:@"complete" data:result];
-      return result;
     }
-    
-    [self emitEvent:@"step" data:@{
-      @"index": @(i),
-      @"action": action,
-      @"status": @"completed",
-      @"stepId": stepId,
-      @"duration": @(stepDuration * 1000)
-    }];
   }
   
-  NSTimeInterval totalDuration = [[NSDate date] timeIntervalSinceDate:startTime];
-  
-  NSDictionary *result = @{
+  return @{
     @"success": @YES,
     @"results": self.results,
-    @"variables": self.variables,
     @"stoppedAt": [NSNull null],
-    @"error": [NSNull null],
-    @"duration": @(totalDuration * 1000)
+    @"error": [NSNull null]
   };
-  
-  [self emitEvent:@"complete" data:result];
-  return result;
 }
 
-- (NSString *)substituteVariables:(NSString *)input
+- (BOOL)executeStep:(NSDictionary *)step error:(NSError **)error
 {
-  if (!input || ![input isKindOfClass:[NSString class]]) {
-    return input;
-  }
-  
-  NSMutableString *result = [input mutableCopy];
-  
-  // Replace ${varName} with variable value
-  NSRegularExpression *regex = [NSRegularExpression regularExpressionWithPattern:@"\\$\\{([^}]+)\\}"
-                                                                         options:0
-                                                                           error:nil];
-  
-  NSArray *matches = [regex matchesInString:input options:0 range:NSMakeRange(0, input.length)];
-  
-  // Process in reverse to maintain correct ranges
-  for (NSTextCheckingResult *match in [matches reverseObjectEnumerator]) {
-    NSRange varNameRange = [match rangeAtIndex:1];
-    NSString *varName = [input substringWithRange:varNameRange];
-    
-    id value = self.variables[varName];
-    if (!value) {
-      value = self.results[varName];
-    }
-    
-    if (value) {
-      NSString *stringValue = [value isKindOfClass:[NSString class]] ? value : [value description];
-      [result replaceCharactersInRange:match.range withString:stringValue];
-    }
-  }
-  
-  return result;
-}
-
-- (id)substituteInObject:(id)obj
-{
-  if ([obj isKindOfClass:[NSString class]]) {
-    return [self substituteVariables:obj];
-  } else if ([obj isKindOfClass:[NSDictionary class]]) {
-    NSMutableDictionary *result = [NSMutableDictionary dictionary];
-    for (NSString *key in obj) {
-      result[key] = [self substituteInObject:obj[key]];
-    }
-    return result;
-  } else if ([obj isKindOfClass:[NSArray class]]) {
-    NSMutableArray *result = [NSMutableArray array];
-    for (id item in obj) {
-      [result addObject:[self substituteInObject:item]];
-    }
-    return result;
-  }
-  return obj;
-}
-
-- (BOOL)executeStep:(NSDictionary *)originalStep error:(NSError **)error
-{
-  // Substitute variables in step
-  NSDictionary *step = [self substituteInObject:originalStep];
   NSString *action = step[@"action"];
   
   if (!action) {
@@ -256,81 +106,43 @@
   if ([action isEqualToString:@"launch"]) return [self executeLaunch:step error:error];
   if ([action isEqualToString:@"terminate"]) return [self executeTerminate:step error:error];
   if ([action isEqualToString:@"activate"]) return [self executeActivate:step error:error];
-  if ([action isEqualToString:@"isRunning"]) return [self executeIsRunning:step error:error];
   
   // Element actions
-  if ([action isEqualToString:@"click"] || [action isEqualToString:@"tap"]) return [self executeClick:step error:error];
+  if ([action isEqualToString:@"click"]) return [self executeClick:step error:error];
+  if ([action isEqualToString:@"tap"]) return [self executeClick:step error:error];  // Alias
   if ([action isEqualToString:@"wait"]) return [self executeWait:step error:error];
   if ([action isEqualToString:@"waitDisappear"]) return [self executeWaitDisappear:step error:error];
   if ([action isEqualToString:@"read"]) return [self executeRead:step error:error];
   if ([action isEqualToString:@"exists"]) return [self executeExists:step error:error];
-  if ([action isEqualToString:@"clickIndex"]) return [self executeClickIndex:step error:error];
-  if ([action isEqualToString:@"findElements"]) return [self executeFindElements:step error:error];
-  if ([action isEqualToString:@"getElementRect"]) return [self executeGetElementRect:step error:error];
   
   // Alert handling
   if ([action isEqualToString:@"handleAlert"]) return [self executeHandleAlert:step error:error];
-  if ([action isEqualToString:@"dismissAlert"]) return [self executeDismissAlert:step error:error];
-  if ([action isEqualToString:@"acceptAlert"]) return [self executeAcceptAlert:step error:error];
   
   // Picker
   if ([action isEqualToString:@"setPicker"]) return [self executeSetPicker:step error:error];
-  if ([action isEqualToString:@"getPicker"]) return [self executeGetPicker:step error:error];
   
   // Coordinates
   if ([action isEqualToString:@"tapXY"]) return [self executeTapXY:step error:error];
-  if ([action isEqualToString:@"doubleTapXY"]) return [self executeDoubleTapXY:step error:error];
-  if ([action isEqualToString:@"longPressXY"]) return [self executeLongPressXY:step error:error];
   if ([action isEqualToString:@"swipe"]) return [self executeSwipe:step error:error];
-  if ([action isEqualToString:@"swipeElement"]) return [self executeSwipeElement:step error:error];
   
   // Input
-  if ([action isEqualToString:@"type"] || [action isEqualToString:@"typeText"]) return [self executeType:step error:error];
+  if ([action isEqualToString:@"type"]) return [self executeType:step error:error];
+  if ([action isEqualToString:@"typeText"]) return [self executeType:step error:error];  // Alias
   if ([action isEqualToString:@"clear"]) return [self executeClear:step error:error];
-  if ([action isEqualToString:@"paste"]) return [self executePaste:step error:error];
   
   // Utility
   if ([action isEqualToString:@"sleep"]) return [self executeSleep:step error:error];
   if ([action isEqualToString:@"screenshot"]) return [self executeScreenshot:step error:error];
   if ([action isEqualToString:@"home"]) return [self executeHome:step error:error];
-  if ([action isEqualToString:@"lock"]) return [self executeLock:step error:error];
-  if ([action isEqualToString:@"unlock"]) return [self executeUnlock:step error:error];
-  if ([action isEqualToString:@"log"]) return [self executeLog:step error:error];
-  
-  // Variables and results
-  if ([action isEqualToString:@"set"]) return [self executeSet:step error:error];
-  if ([action isEqualToString:@"increment"]) return [self executeIncrement:step error:error];
-  if ([action isEqualToString:@"decrement"]) return [self executeDecrement:step error:error];
-  if ([action isEqualToString:@"concat"]) return [self executeConcat:step error:error];
-  if ([action isEqualToString:@"parseDate"]) return [self executeParseDate:step error:error];
-  if ([action isEqualToString:@"formatDate"]) return [self executeFormatDate:step error:error];
-  if ([action isEqualToString:@"math"]) return [self executeMath:step error:error];
-  
-  // Control flow
-  if ([action isEqualToString:@"if"]) return [self executeIf:step error:error];
-  if ([action isEqualToString:@"while"]) return [self executeWhile:step error:error];
-  if ([action isEqualToString:@"repeat"]) return [self executeRepeat:step error:error];
-  if ([action isEqualToString:@"forEach"]) return [self executeForEach:step error:error];
-  if ([action isEqualToString:@"break"]) { self.shouldBreak = YES; return YES; }
-  if ([action isEqualToString:@"continue"]) { self.shouldContinue = YES; return YES; }
-  if ([action isEqualToString:@"try"]) return [self executeTry:step error:error];
-  if ([action isEqualToString:@"return"]) return [self executeReturn:step error:error];
-  
-  // Assertions
-  if ([action isEqualToString:@"assert"]) return [self executeAssert:step error:error];
-  if ([action isEqualToString:@"assertExists"]) return [self executeAssertExists:step error:error];
-  if ([action isEqualToString:@"assertNotExists"]) return [self executeAssertNotExists:step error:error];
-  if ([action isEqualToString:@"assertText"]) return [self executeAssertText:step error:error];
   
 #if !TARGET_OS_TV
   // Vision/OCR
-  if ([action isEqualToString:@"clickText"] || [action isEqualToString:@"tapText"]) return [self executeClickText:step error:error];
+  if ([action isEqualToString:@"clickText"]) return [self executeClickText:step error:error];
+  if ([action isEqualToString:@"tapText"]) return [self executeClickText:step error:error];  // Alias
   if ([action isEqualToString:@"waitText"]) return [self executeWaitText:step error:error];
-  if ([action isEqualToString:@"readScreen"]) return [self executeReadScreen:step error:error];
   if ([action isEqualToString:@"readRegion"]) return [self executeReadRegion:step error:error];
-  if ([action isEqualToString:@"clickImage"] || [action isEqualToString:@"tapImage"]) return [self executeClickImage:step error:error];
-  if ([action isEqualToString:@"waitImage"]) return [self executeWaitImage:step error:error];
-  if ([action isEqualToString:@"findText"]) return [self executeFindText:step error:error];
+  if ([action isEqualToString:@"clickImage"]) return [self executeClickImage:step error:error];
+  if ([action isEqualToString:@"tapImage"]) return [self executeClickImage:step error:error];  // Alias
 #endif
   
   *error = [NSError errorWithDomain:@"FBScriptExecutor" code:2
@@ -350,33 +162,21 @@
   }
   
   NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
-  NSNumber *retries = step[@"retries"] ?: @1;
-  NSTimeInterval retryDelay = [step[@"retryDelay"] doubleValue] ?: 2.0;
   
-  for (NSInteger attempt = 0; attempt < retries.integerValue; attempt++) {
-    if (attempt > 0) {
-      [self log:[NSString stringWithFormat:@"Launch attempt %ld of %@", (long)attempt + 1, retries] level:@"info"];
-      [NSThread sleepForTimeInterval:retryDelay];
+  XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
+  [app launch];
+  self.currentApp = app;
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    if (app.state == XCUIApplicationStateRunningForeground) {
+      return YES;
     }
-    
-    XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
-    [app launch];
-    self.currentApp = app;
-    
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-      if (app.state == XCUIApplicationStateRunningForeground) {
-        // Store app state
-        self.variables[@"_appBundleId"] = bundleId;
-        self.variables[@"_appState"] = @"foreground";
-        return YES;
-      }
-      [NSThread sleepForTimeInterval:0.1];
-    }
+    [NSThread sleepForTimeInterval:0.1];
   }
   
   *error = [NSError errorWithDomain:@"FBScriptExecutor" code:4
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"App '%@' did not launch within timeout after %@ attempts", bundleId, retries]}];
+                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"App '%@' did not launch within %.1fs", bundleId, timeout]}];
   return NO;
 }
 
@@ -391,18 +191,7 @@
   
   XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
   [app terminate];
-  
-  // Wait for termination
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 5.0;
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    if (app.state == XCUIApplicationStateNotRunning || app.state == XCUIApplicationStateUnknown) {
-      return YES;
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  return YES; // Don't fail if app doesn't terminate cleanly
+  return YES;
 }
 
 - (BOOL)executeActivate:(NSDictionary *)step error:(NSError **)error
@@ -417,28 +206,6 @@
   XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
   [app activate];
   self.currentApp = app;
-  
-  self.variables[@"_appBundleId"] = bundleId;
-  return YES;
-}
-
-- (BOOL)executeIsRunning:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *bundleId = step[@"bundleId"];
-  NSString *key = step[@"as"] ?: @"isRunning";
-  
-  if (!bundleId) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:3
-                             userInfo:@{NSLocalizedDescriptionKey: @"'bundleId' required for isRunning"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [[XCUIApplication alloc] initWithBundleIdentifier:bundleId];
-  BOOL running = (app.state == XCUIApplicationStateRunningForeground || 
-                  app.state == XCUIApplicationStateRunningBackground ||
-                  app.state == XCUIApplicationStateRunningBackgroundSuspended);
-  
-  self.results[key] = running ? @"true" : @"false";
   return YES;
 }
 
@@ -461,7 +228,7 @@
   NSString *type = selectorType ?: @"accessibilityId";
   
   if ([type isEqualToString:@"accessibilityId"] || [type isEqualToString:@"id"]) {
-    // Try common element types first
+    // Try common element types first for performance
     XCUIElement *element = app.buttons[selector];
     if (element.exists) return element;
     
@@ -469,12 +236,6 @@
     if (element.exists) return element;
     
     element = app.textFields[selector];
-    if (element.exists) return element;
-    
-    element = app.secureTextFields[selector];
-    if (element.exists) return element;
-    
-    element = app.textViews[selector];
     if (element.exists) return element;
     
     element = app.images[selector];
@@ -486,18 +247,13 @@
     element = app.switches[selector];
     if (element.exists) return element;
     
-    element = app.tables[selector];
-    if (element.exists) return element;
-    
-    element = app.collectionViews[selector];
-    if (element.exists) return element;
-    
     element = app.otherElements[selector];
     if (element.exists) return element;
     
-    // Generic query
+    // Fallback to generic query
     NSPredicate *predicate = [NSPredicate predicateWithFormat:@"identifier == %@ OR label == %@", selector, selector];
-    return [[app descendantsMatchingType:XCUIElementTypeAny] elementMatchingPredicate:predicate];
+    XCUIElementQuery *query = [app descendantsMatchingType:XCUIElementTypeAny];
+    return [query elementMatchingPredicate:predicate];
   }
   
   if ([type isEqualToString:@"classChain"]) {
@@ -524,66 +280,7 @@
     return [[app descendantsMatchingType:XCUIElementTypeAny] elementMatchingPredicate:predicate];
   }
   
-  if ([type isEqualToString:@"value"]) {
-    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"value == %@", selector];
-    return [[app descendantsMatchingType:XCUIElementTypeAny] elementMatchingPredicate:predicate];
-  }
-  
-  if ([type isEqualToString:@"valueContains"]) {
-    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"value CONTAINS %@", selector];
-    return [[app descendantsMatchingType:XCUIElementTypeAny] elementMatchingPredicate:predicate];
-  }
-  
   return nil;
-}
-
-- (NSArray<XCUIElement *> *)findElementsWithSelector:(NSString *)selector
-                                        selectorType:(NSString *)selectorType
-                                               inApp:(XCUIApplication *)app
-                                               limit:(NSInteger)limit
-{
-  if (!selector) return @[];
-  
-  NSString *type = selectorType ?: @"accessibilityId";
-  NSMutableArray<XCUIElement *> *results = [NSMutableArray array];
-  
-  XCUIElementQuery *query = nil;
-  
-  if ([type isEqualToString:@"classChain"]) {
-    NSArray *elements = [app fb_descendantsMatchingClassChain:selector shouldReturnAfterFirstMatch:NO];
-    if (limit > 0 && elements.count > limit) {
-      return [elements subarrayWithRange:NSMakeRange(0, limit)];
-    }
-    return elements;
-  }
-  
-  if ([type isEqualToString:@"predicate"]) {
-    @try {
-      NSPredicate *predicate = [NSPredicate predicateWithFormat:selector];
-      query = [[app descendantsMatchingType:XCUIElementTypeAny] matchingPredicate:predicate];
-    } @catch (NSException *exception) {
-      return @[];
-    }
-  } else if ([type isEqualToString:@"accessibilityId"] || [type isEqualToString:@"id"]) {
-    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"identifier == %@ OR label == %@", selector, selector];
-    query = [[app descendantsMatchingType:XCUIElementTypeAny] matchingPredicate:predicate];
-  } else if ([type isEqualToString:@"label"]) {
-    NSPredicate *predicate = [NSPredicate predicateWithFormat:@"label == %@", selector];
-    query = [[app descendantsMatchingType:XCUIElementTypeAny] matchingPredicate:predicate];
-  }
-  
-  if (query) {
-    NSUInteger count = query.count;
-    NSUInteger maxCount = limit > 0 ? MIN(count, limit) : count;
-    for (NSUInteger i = 0; i < maxCount; i++) {
-      XCUIElement *element = [query elementBoundByIndex:i];
-      if (element.exists) {
-        [results addObject:element];
-      }
-    }
-  }
-  
-  return results;
 }
 
 #pragma mark - Element Actions
@@ -593,8 +290,6 @@
   NSString *selector = step[@"selector"];
   NSString *selectorType = step[@"selectorType"];
   NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
-  NSNumber *offsetX = step[@"offsetX"];
-  NSNumber *offsetY = step[@"offsetY"];
   
   if (!selector) {
     *error = [NSError errorWithDomain:@"FBScriptExecutor" code:5
@@ -608,16 +303,7 @@
   while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
     XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
     if (element && element.exists && element.isHittable) {
-      if (offsetX || offsetY) {
-        CGRect frame = element.frame;
-        CGFloat x = frame.origin.x + (offsetX ? offsetX.doubleValue : frame.size.width / 2);
-        CGFloat y = frame.origin.y + (offsetY ? offsetY.doubleValue : frame.size.height / 2);
-        XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
-                                 coordinateWithOffset:CGVectorMake(x, y)];
-        [coord tap];
-      } else {
-        [element tap];
-      }
+      [element tap];
       return YES;
     }
     [NSThread sleepForTimeInterval:0.1];
@@ -625,148 +311,6 @@
   
   *error = [NSError errorWithDomain:@"FBScriptExecutor" code:6
                            userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' not found or not clickable within %.1fs", selector, timeout]}];
-  return NO;
-}
-
-- (BOOL)executeClickIndex:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSNumber *index = step[@"index"];
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
-  NSNumber *offsetX = step[@"offsetX"];
-  NSNumber *offsetY = step[@"offsetY"];
-  
-  if (!selector || index == nil) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:5
-                             userInfo:@{NSLocalizedDescriptionKey: @"'selector' and 'index' required for clickIndex"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    NSArray<XCUIElement *> *elements = [self findElementsWithSelector:selector 
-                                                         selectorType:selectorType 
-                                                                inApp:app 
-                                                                limit:index.integerValue + 1];
-    
-    if (elements.count > index.unsignedIntegerValue) {
-      XCUIElement *element = elements[index.unsignedIntegerValue];
-      if (element.exists && element.isHittable) {
-        if (offsetX || offsetY) {
-          CGRect frame = element.frame;
-          CGFloat x = frame.origin.x + (offsetX ? offsetX.doubleValue : frame.size.width / 2);
-          CGFloat y = frame.origin.y + (offsetY ? offsetY.doubleValue : frame.size.height / 2);
-          XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
-                                   coordinateWithOffset:CGVectorMake(x, y)];
-          [coord tap];
-        } else {
-          [element tap];
-        }
-        return YES;
-      }
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:7
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element at index %@ not found for selector '%@'", index, selector]}];
-  return NO;
-}
-
-- (BOOL)executeFindElements:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *key = step[@"as"] ?: @"elements";
-  NSNumber *limit = step[@"limit"];
-  
-  if (!selector) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:5
-                             userInfo:@{NSLocalizedDescriptionKey: @"'selector' required for findElements"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSArray<XCUIElement *> *elements = [self findElementsWithSelector:selector 
-                                                       selectorType:selectorType 
-                                                              inApp:app 
-                                                              limit:limit.integerValue];
-  
-  // Store element info in cache and results
-  [self.elementCache removeAllObjects];
-  NSMutableArray *elementData = [NSMutableArray array];
-  
-  for (NSUInteger i = 0; i < elements.count; i++) {
-    XCUIElement *element = elements[i];
-    CGRect frame = element.frame;
-    
-    NSDictionary *info = @{
-      @"index": @(i),
-      @"x": @(frame.origin.x),
-      @"y": @(frame.origin.y),
-      @"width": @(frame.size.width),
-      @"height": @(frame.size.height),
-      @"label": element.label ?: @"",
-      @"value": [element valueForKey:@"value"] ?: @"",
-      @"isEnabled": @(element.isEnabled),
-      @"isHittable": @(element.isHittable)
-    };
-    
-    [self.elementCache addObject:info];
-    [elementData addObject:info];
-  }
-  
-  // Store count and data
-  self.results[[key stringByAppendingString:@"_count"]] = [NSString stringWithFormat:@"%lu", (unsigned long)elements.count];
-  self.variables[key] = elementData;
-  
-  return YES;
-}
-
-- (BOOL)executeGetElementRect:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *key = step[@"as"] ?: @"rect";
-  NSNumber *index = step[@"index"] ?: @0;
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 5.0;
-  
-  if (!selector) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:5
-                             userInfo:@{NSLocalizedDescriptionKey: @"'selector' required for getElementRect"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    NSArray<XCUIElement *> *elements = [self findElementsWithSelector:selector 
-                                                         selectorType:selectorType 
-                                                                inApp:app 
-                                                                limit:index.integerValue + 1];
-    
-    if (elements.count > index.unsignedIntegerValue) {
-      XCUIElement *element = elements[index.unsignedIntegerValue];
-      if (element.exists) {
-        CGRect frame = element.frame;
-        self.results[[key stringByAppendingString:@"_x"]] = [NSString stringWithFormat:@"%.0f", frame.origin.x];
-        self.results[[key stringByAppendingString:@"_y"]] = [NSString stringWithFormat:@"%.0f", frame.origin.y];
-        self.results[[key stringByAppendingString:@"_width"]] = [NSString stringWithFormat:@"%.0f", frame.size.width];
-        self.results[[key stringByAppendingString:@"_height"]] = [NSString stringWithFormat:@"%.0f", frame.size.height];
-        self.results[[key stringByAppendingString:@"_centerX"]] = [NSString stringWithFormat:@"%.0f", CGRectGetMidX(frame)];
-        self.results[[key stringByAppendingString:@"_centerY"]] = [NSString stringWithFormat:@"%.0f", CGRectGetMidY(frame)];
-        return YES;
-      }
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:8
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' at index %@ not found", selector, index]}];
   return NO;
 }
 
@@ -793,7 +337,7 @@
     [NSThread sleepForTimeInterval:0.1];
   }
   
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:9
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:7
                            userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' not found within %.1fs", selector, timeout]}];
   return NO;
 }
@@ -821,7 +365,7 @@
     [NSThread sleepForTimeInterval:0.1];
   }
   
-  // Timeout is not an error for waitDisappear - element may still be visible
+  // Not an error - element may still be visible
   return YES;
 }
 
@@ -830,7 +374,6 @@
   NSString *selector = step[@"selector"];
   NSString *selectorType = step[@"selectorType"];
   NSString *key = step[@"as"];
-  NSString *attribute = step[@"attribute"] ?: @"label";  // label, value, or identifier
   NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
   
   if (!selector) {
@@ -840,7 +383,7 @@
   }
   
   if (!key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:10
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:8
                              userInfo:@{NSLocalizedDescriptionKey: @"'as' key required for read action"}];
     return NO;
   }
@@ -851,25 +394,17 @@
   while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
     XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
     if (element && element.exists) {
-      NSString *value = nil;
-      
-      if ([attribute isEqualToString:@"label"]) {
-        value = element.label;
-      } else if ([attribute isEqualToString:@"value"]) {
+      NSString *value = element.label;
+      if (!value || value.length == 0) {
         value = [element valueForKey:@"value"];
-      } else if ([attribute isEqualToString:@"identifier"]) {
-        value = element.identifier;
-      } else if ([attribute isEqualToString:@"placeholderValue"]) {
-        value = element.placeholderValue;
       }
-      
       self.results[key] = value ?: @"";
       return YES;
     }
     [NSThread sleepForTimeInterval:0.1];
   }
   
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:11
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:9
                            userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' not found for reading within %.1fs", selector, timeout]}];
   return NO;
 }
@@ -879,26 +414,11 @@
   NSString *selector = step[@"selector"];
   NSString *selectorType = step[@"selectorType"];
   NSString *key = step[@"as"] ?: @"exists";
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 0;  // Default: no wait
   
   XCUIApplication *app = [self getTargetApp];
+  XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
   
-  if (timeout > 0) {
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-      XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-      if (element && element.exists) {
-        self.results[key] = @"true";
-        return YES;
-      }
-      [NSThread sleepForTimeInterval:0.1];
-    }
-    self.results[key] = @"false";
-  } else {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    self.results[key] = (element && element.exists) ? @"true" : @"false";
-  }
-  
+  self.results[key] = (element && element.exists) ? @"true" : @"false";
   return YES;
 }
 
@@ -908,32 +428,47 @@
 {
   NSString *buttonName = step[@"button"];
   NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 3.0;
-  NSNumber *retries = step[@"retries"] ?: @1;
   
   if (!buttonName) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:12
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:10
                              userInfo:@{NSLocalizedDescriptionKey: @"'button' required for handleAlert"}];
     return NO;
   }
   
-  for (NSInteger attempt = 0; attempt < retries.integerValue; attempt++) {
-    if (attempt > 0) {
-      [NSThread sleepForTimeInterval:0.5];
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    // Check springboard for system alerts
+    XCUIElement *alertButton = self.springboard.buttons[buttonName];
+    if (alertButton.exists && alertButton.isHittable) {
+      [alertButton tap];
+      [NSThread sleepForTimeInterval:0.3];
+      return YES;
     }
     
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    // Check springboard alerts
+    XCUIElementQuery *alerts = self.springboard.alerts;
+    if (alerts.count > 0) {
+      XCUIElement *alert = [alerts elementBoundByIndex:0];
+      XCUIElement *btn = alert.buttons[buttonName];
+      if (btn.exists && btn.isHittable) {
+        [btn tap];
+        [NSThread sleepForTimeInterval:0.3];
+        return YES;
+      }
+    }
     
-    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-      // Check springboard for system alerts
-      XCUIElement *alertButton = self.springboard.buttons[buttonName];
+    // Check current app for in-app alerts
+    XCUIApplication *app = [self getTargetApp];
+    if (app) {
+      alertButton = app.buttons[buttonName];
       if (alertButton.exists && alertButton.isHittable) {
         [alertButton tap];
         [NSThread sleepForTimeInterval:0.3];
         return YES;
       }
       
-      // Check springboard alerts
-      XCUIElementQuery *alerts = self.springboard.alerts;
+      alerts = app.alerts;
       if (alerts.count > 0) {
         XCUIElement *alert = [alerts elementBoundByIndex:0];
         XCUIElement *btn = alert.buttons[buttonName];
@@ -944,138 +479,31 @@
         }
       }
       
-      // Check current app
-      XCUIApplication *app = [self getTargetApp];
-      if (app) {
-        alertButton = app.buttons[buttonName];
-        if (alertButton.exists && alertButton.isHittable) {
-          [alertButton tap];
+      // Check sheets
+      XCUIElementQuery *sheets = app.sheets;
+      if (sheets.count > 0) {
+        XCUIElement *sheet = [sheets elementBoundByIndex:0];
+        XCUIElement *btn = sheet.buttons[buttonName];
+        if (btn.exists && btn.isHittable) {
+          [btn tap];
           [NSThread sleepForTimeInterval:0.3];
           return YES;
         }
-        
-        alerts = app.alerts;
-        if (alerts.count > 0) {
-          XCUIElement *alert = [alerts elementBoundByIndex:0];
-          XCUIElement *btn = alert.buttons[buttonName];
-          if (btn.exists && btn.isHittable) {
-            [btn tap];
-            [NSThread sleepForTimeInterval:0.3];
-            return YES;
-          }
-        }
-        
-        // Check sheets
-        XCUIElementQuery *sheets = app.sheets;
-        if (sheets.count > 0) {
-          XCUIElement *sheet = [sheets elementBoundByIndex:0];
-          XCUIElement *btn = sheet.buttons[buttonName];
-          if (btn.exists && btn.isHittable) {
-            [btn tap];
-            [NSThread sleepForTimeInterval:0.3];
-            return YES;
-          }
-        }
       }
-      
-      [NSThread sleepForTimeInterval:0.1];
     }
+    
+    [NSThread sleepForTimeInterval:0.1];
   }
   
+  // Alert handling is optional by nature - not finding is not always an error
   NSNumber *optional = step[@"optional"];
   if (optional && optional.boolValue) {
     return YES;
   }
   
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:13
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Alert button '%@' not found", buttonName]}];
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:11
+                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Alert button '%@' not found within %.1fs", buttonName, timeout]}];
   return NO;
-}
-
-- (BOOL)executeDismissAlert:(NSDictionary *)step error:(NSError **)error
-{
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 2.0;
-  NSArray *dismissButtons = @[@"Cancel", @"No", @"Don't Allow", @"Not Now", @"Later", @"Dismiss"];
-  
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    // Check springboard
-    XCUIElementQuery *alerts = self.springboard.alerts;
-    if (alerts.count > 0) {
-      XCUIElement *alert = [alerts elementBoundByIndex:0];
-      for (NSString *buttonName in dismissButtons) {
-        XCUIElement *btn = alert.buttons[buttonName];
-        if (btn.exists && btn.isHittable) {
-          [btn tap];
-          return YES;
-        }
-      }
-    }
-    
-    // Check current app
-    XCUIApplication *app = [self getTargetApp];
-    if (app) {
-      alerts = app.alerts;
-      if (alerts.count > 0) {
-        XCUIElement *alert = [alerts elementBoundByIndex:0];
-        for (NSString *buttonName in dismissButtons) {
-          XCUIElement *btn = alert.buttons[buttonName];
-          if (btn.exists && btn.isHittable) {
-            [btn tap];
-            return YES;
-          }
-        }
-      }
-    }
-    
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  return YES;  // Don't fail if no alert found
-}
-
-- (BOOL)executeAcceptAlert:(NSDictionary *)step error:(NSError **)error
-{
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 2.0;
-  NSArray *acceptButtons = @[@"OK", @"Allow", @"Yes", @"Accept", @"Continue", @"Open", @"Allow Full Access", @"Allow While Using App"];
-  
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    // Check springboard
-    XCUIElementQuery *alerts = self.springboard.alerts;
-    if (alerts.count > 0) {
-      XCUIElement *alert = [alerts elementBoundByIndex:0];
-      for (NSString *buttonName in acceptButtons) {
-        XCUIElement *btn = alert.buttons[buttonName];
-        if (btn.exists && btn.isHittable) {
-          [btn tap];
-          return YES;
-        }
-      }
-    }
-    
-    // Check current app
-    XCUIApplication *app = [self getTargetApp];
-    if (app) {
-      alerts = app.alerts;
-      if (alerts.count > 0) {
-        XCUIElement *alert = [alerts elementBoundByIndex:0];
-        for (NSString *buttonName in acceptButtons) {
-          XCUIElement *btn = alert.buttons[buttonName];
-          if (btn.exists && btn.isHittable) {
-            [btn tap];
-            return YES;
-          }
-        }
-      }
-    }
-    
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  return YES;
 }
 
 #pragma mark - Picker Actions
@@ -1087,13 +515,13 @@
   NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
   
   if (index == nil) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:14
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:12
                              userInfo:@{NSLocalizedDescriptionKey: @"'index' required for setPicker"}];
     return NO;
   }
   
   if (!value) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:15
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:13
                              userInfo:@{NSLocalizedDescriptionKey: @"'value' required for setPicker"}];
     return NO;
   }
@@ -1113,40 +541,8 @@
     [NSThread sleepForTimeInterval:0.1];
   }
   
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:16
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Picker at index %@ not found", index]}];
-  return NO;
-}
-
-- (BOOL)executeGetPicker:(NSDictionary *)step error:(NSError **)error
-{
-  NSNumber *index = step[@"index"];
-  NSString *key = step[@"as"] ?: @"pickerValue";
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 5.0;
-  
-  if (index == nil) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:14
-                             userInfo:@{NSLocalizedDescriptionKey: @"'index' required for getPicker"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    XCUIElementQuery *pickers = app.pickerWheels;
-    if (pickers.count > index.unsignedIntegerValue) {
-      XCUIElement *picker = [pickers elementBoundByIndex:index.unsignedIntegerValue];
-      if (picker.exists) {
-        self.results[key] = [picker valueForKey:@"value"] ?: @"";
-        return YES;
-      }
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:16
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Picker at index %@ not found", index]}];
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:14
+                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Picker at index %@ not found within %.1fs", index, timeout]}];
   return NO;
 }
 
@@ -1158,52 +554,15 @@
   NSNumber *y = step[@"y"];
   
   if (!x || !y) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:17
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:15
                              userInfo:@{NSLocalizedDescriptionKey: @"'x' and 'y' required for tapXY"}];
     return NO;
   }
   
   XCUIApplication *app = [self getTargetApp];
-  XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
-                           coordinateWithOffset:CGVectorMake(x.doubleValue, y.doubleValue)];
-  [coord tap];
-  return YES;
-}
-
-- (BOOL)executeDoubleTapXY:(NSDictionary *)step error:(NSError **)error
-{
-  NSNumber *x = step[@"x"];
-  NSNumber *y = step[@"y"];
-  
-  if (!x || !y) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:17
-                             userInfo:@{NSLocalizedDescriptionKey: @"'x' and 'y' required for doubleTapXY"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
-                           coordinateWithOffset:CGVectorMake(x.doubleValue, y.doubleValue)];
-  [coord doubleTap];
-  return YES;
-}
-
-- (BOOL)executeLongPressXY:(NSDictionary *)step error:(NSError **)error
-{
-  NSNumber *x = step[@"x"];
-  NSNumber *y = step[@"y"];
-  NSTimeInterval duration = [step[@"duration"] doubleValue] ?: 1.0;
-  
-  if (!x || !y) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:17
-                             userInfo:@{NSLocalizedDescriptionKey: @"'x' and 'y' required for longPressXY"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
-                           coordinateWithOffset:CGVectorMake(x.doubleValue, y.doubleValue)];
-  [coord pressForDuration:duration];
+  XCUICoordinate *coord = [app coordinateWithNormalizedOffset:CGVectorMake(0, 0)];
+  XCUICoordinate *target = [coord coordinateWithOffset:CGVectorMake(x.doubleValue, y.doubleValue)];
+  [target tap];
   return YES;
 }
 
@@ -1213,10 +572,10 @@
   NSNumber *y = step[@"y"];
   NSNumber *toX = step[@"toX"];
   NSNumber *toY = step[@"toY"];
-  NSTimeInterval duration = [step[@"duration"] doubleValue] ?: 0.3;
+  NSNumber *duration = step[@"duration"];
   
   if (!x || !y || !toX || !toY) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:18
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:16
                              userInfo:@{NSLocalizedDescriptionKey: @"'x', 'y', 'toX', 'toY' required for swipe"}];
     return NO;
   }
@@ -1227,46 +586,9 @@
   XCUICoordinate *end = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
                          coordinateWithOffset:CGVectorMake(toX.doubleValue, toY.doubleValue)];
   
-  [start pressForDuration:duration thenDragToCoordinate:end];
+  NSTimeInterval dur = duration ? duration.doubleValue : 0.3;
+  [start pressForDuration:dur thenDragToCoordinate:end];
   return YES;
-}
-
-- (BOOL)executeSwipeElement:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *direction = step[@"direction"];  // up, down, left, right
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 5.0;
-  
-  if (!selector || !direction) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:19
-                             userInfo:@{NSLocalizedDescriptionKey: @"'selector' and 'direction' required for swipeElement"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    if (element && element.exists) {
-      if ([direction isEqualToString:@"up"]) {
-        [element swipeUp];
-      } else if ([direction isEqualToString:@"down"]) {
-        [element swipeDown];
-      } else if ([direction isEqualToString:@"left"]) {
-        [element swipeLeft];
-      } else if ([direction isEqualToString:@"right"]) {
-        [element swipeRight];
-      }
-      return YES;
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:20
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' not found for swipe", selector]}];
-  return NO;
 }
 
 #pragma mark - Input Actions
@@ -1277,37 +599,34 @@
   NSString *selector = step[@"selector"];
   NSString *selectorType = step[@"selectorType"];
   NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
-  BOOL clearFirst = [step[@"clear"] boolValue];
   
   if (!text) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:21
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:17
                              userInfo:@{NSLocalizedDescriptionKey: @"'value' or 'text' required for type action"}];
     return NO;
   }
   
   XCUIApplication *app = [self getTargetApp];
   
+  // If selector provided, tap element first
   if (selector) {
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    BOOL found = NO;
     
     while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
       XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
       if (element && element.exists) {
         [element tap];
-        
-        if (clearFirst) {
-          // Select all and delete
-          [element pressForDuration:1.0];
-          XCUIElement *selectAll = app.menuItems[@"Select All"];
-          if ([selectAll waitForExistenceWithTimeout:1.0]) {
-            [selectAll tap];
-            [app typeText:XCUIKeyboardKeyDelete];
-          }
-        }
-        
+        found = YES;
         break;
       }
       [NSThread sleepForTimeInterval:0.1];
+    }
+    
+    if (!found) {
+      *error = [NSError errorWithDomain:@"FBScriptExecutor" code:18
+                               userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' not found for typing", selector]}];
+      return NO;
     }
   }
   
@@ -1337,7 +656,7 @@
       [element pressForDuration:1.0];
       
       XCUIElement *selectAll = app.menuItems[@"Select All"];
-      if ([selectAll waitForExistenceWithTimeout:1.0]) {
+      if (selectAll.waitForExistenceWithTimeout:1.0]) {
         [selectAll tap];
         [app typeText:XCUIKeyboardKeyDelete];
       }
@@ -1346,32 +665,9 @@
     [NSThread sleepForTimeInterval:0.1];
   }
   
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:22
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:19
                            userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Element '%@' not found for clearing", selector]}];
   return NO;
-}
-
-- (BOOL)executePaste:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *text = step[@"value"] ?: step[@"text"];
-  
-  if (!text) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:21
-                             userInfo:@{NSLocalizedDescriptionKey: @"'value' or 'text' required for paste"}];
-    return NO;
-  }
-  
-  UIPasteboard *pasteboard = [UIPasteboard generalPasteboard];
-  pasteboard.string = text;
-  
-  // Tap paste if available
-  XCUIApplication *app = [self getTargetApp];
-  XCUIElement *pasteMenu = app.menuItems[@"Paste"];
-  if ([pasteMenu waitForExistenceWithTimeout:1.0]) {
-    [pasteMenu tap];
-  }
-  
-  return YES;
 }
 
 #pragma mark - Utility Actions
@@ -1386,22 +682,12 @@
 - (BOOL)executeScreenshot:(NSDictionary *)step error:(NSError **)error
 {
   NSString *key = step[@"as"] ?: @"screenshot";
-  BOOL full = [step[@"full"] boolValue];  // Full quality or compressed
   
   XCUIScreenshot *screenshot = XCUIScreen.mainScreen.screenshot;
-  NSData *imageData;
+  NSData *pngData = screenshot.PNGRepresentation;
+  NSString *base64 = [pngData base64EncodedStringWithOptions:0];
   
-  if (full) {
-    imageData = screenshot.PNGRepresentation;
-  } else {
-    // Compressed JPEG for faster transfer
-    UIImage *image = screenshot.image;
-    imageData = UIImageJPEGRepresentation(image, 0.7);
-  }
-  
-  NSString *base64 = [imageData base64EncodedStringWithOptions:0];
   self.results[key] = base64;
-  
   return YES;
 }
 
@@ -1409,707 +695,6 @@
 {
   [[XCUIDevice sharedDevice] pressButton:XCUIDeviceButtonHome];
   return YES;
-}
-
-- (BOOL)executeLock:(NSDictionary *)step error:(NSError **)error
-{
-  NSError *lockError = nil;
-  if (![[XCUIDevice sharedDevice] fb_lockScreen:&lockError]) {
-    *error = lockError;
-    return NO;
-  }
-  return YES;
-}
-
-- (BOOL)executeUnlock:(NSDictionary *)step error:(NSError **)error
-{
-  NSError *unlockError = nil;
-  if (![[XCUIDevice sharedDevice] fb_unlockScreen:&unlockError]) {
-    *error = unlockError;
-    return NO;
-  }
-  return YES;
-}
-
-- (BOOL)executeLog:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *message = step[@"message"] ?: @"";
-  NSString *level = step[@"level"] ?: @"info";
-  
-  [self log:message level:level];
-  return YES;
-}
-
-#pragma mark - Variables and Results
-
-- (BOOL)executeSet:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *key = step[@"key"];
-  id value = step[@"value"];
-  NSString *target = step[@"target"] ?: @"variables";  // "variables" or "results"
-  
-  if (!key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:23
-                             userInfo:@{NSLocalizedDescriptionKey: @"'key' required for set"}];
-    return NO;
-  }
-  
-  NSString *stringValue = [value isKindOfClass:[NSString class]] ? value : [value description];
-  
-  if ([target isEqualToString:@"results"]) {
-    self.results[key] = stringValue;
-  } else {
-    self.variables[key] = value;  // Keep original type for variables
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeIncrement:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *key = step[@"key"];
-  NSNumber *by = step[@"by"] ?: @1;
-  
-  if (!key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:23
-                             userInfo:@{NSLocalizedDescriptionKey: @"'key' required for increment"}];
-    return NO;
-  }
-  
-  id current = self.variables[key] ?: self.results[key] ?: @0;
-  NSInteger value = [current integerValue] + by.integerValue;
-  
-  self.variables[key] = @(value);
-  self.results[key] = [NSString stringWithFormat:@"%ld", (long)value];
-  
-  return YES;
-}
-
-- (BOOL)executeDecrement:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *key = step[@"key"];
-  NSNumber *by = step[@"by"] ?: @1;
-  
-  if (!key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:23
-                             userInfo:@{NSLocalizedDescriptionKey: @"'key' required for decrement"}];
-    return NO;
-  }
-  
-  id current = self.variables[key] ?: self.results[key] ?: @0;
-  NSInteger value = [current integerValue] - by.integerValue;
-  
-  self.variables[key] = @(value);
-  self.results[key] = [NSString stringWithFormat:@"%ld", (long)value];
-  
-  return YES;
-}
-
-- (BOOL)executeConcat:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *key = step[@"key"];
-  NSArray *values = step[@"values"];
-  NSString *separator = step[@"separator"] ?: @"";
-  
-  if (!key || !values) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:23
-                             userInfo:@{NSLocalizedDescriptionKey: @"'key' and 'values' required for concat"}];
-    return NO;
-  }
-  
-  NSMutableArray *stringValues = [NSMutableArray array];
-  for (id value in values) {
-    NSString *str = [value isKindOfClass:[NSString class]] ? value : [value description];
-    str = [self substituteVariables:str];
-    [stringValues addObject:str];
-  }
-  
-  NSString *result = [stringValues componentsJoinedByString:separator];
-  self.variables[key] = result;
-  self.results[key] = result;
-  
-  return YES;
-}
-
-- (BOOL)executeParseDate:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *input = step[@"input"];
-  NSString *key = step[@"as"];
-  NSArray *formats = step[@"formats"];
-  
-  if (!input || !key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:24
-                             userInfo:@{NSLocalizedDescriptionKey: @"'input' and 'as' required for parseDate"}];
-    return NO;
-  }
-  
-  input = [self substituteVariables:input];
-  
-  if (!formats) {
-    formats = @[
-      @"M/d/yyyy h:mm a",
-      @"MM/dd h:mm a",
-      @"h:mm a",
-      @"yyyy-MM-dd HH:mm:ss",
-      @"yyyy-MM-dd'T'HH:mm:ssZ"
-    ];
-  }
-  
-  NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-  formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-  
-  NSDate *date = nil;
-  for (NSString *format in formats) {
-    formatter.dateFormat = format;
-    date = [formatter dateFromString:input];
-    if (date) break;
-  }
-  
-  if (date) {
-    self.variables[key] = date;
-    self.results[[key stringByAppendingString:@"_timestamp"]] = [NSString stringWithFormat:@"%.0f", [date timeIntervalSince1970] * 1000];
-    
-    NSCalendar *calendar = [NSCalendar currentCalendar];
-    NSDateComponents *components = [calendar components:(NSCalendarUnitYear | NSCalendarUnitMonth | NSCalendarUnitDay | NSCalendarUnitHour | NSCalendarUnitMinute) fromDate:date];
-    self.results[[key stringByAppendingString:@"_year"]] = [NSString stringWithFormat:@"%ld", (long)components.year];
-    self.results[[key stringByAppendingString:@"_month"]] = [NSString stringWithFormat:@"%ld", (long)components.month];
-    self.results[[key stringByAppendingString:@"_day"]] = [NSString stringWithFormat:@"%ld", (long)components.day];
-    self.results[[key stringByAppendingString:@"_hour"]] = [NSString stringWithFormat:@"%ld", (long)components.hour];
-    self.results[[key stringByAppendingString:@"_minute"]] = [NSString stringWithFormat:@"%ld", (long)components.minute];
-    
-    return YES;
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:25
-                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Could not parse date: %@", input]}];
-  return NO;
-}
-
-- (BOOL)executeFormatDate:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *format = step[@"format"];
-  NSString *key = step[@"as"];
-  NSNumber *timestamp = step[@"timestamp"];
-  NSString *dateKey = step[@"dateKey"];
-  
-  if (!format || !key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:24
-                             userInfo:@{NSLocalizedDescriptionKey: @"'format' and 'as' required for formatDate"}];
-    return NO;
-  }
-  
-  NSDate *date = nil;
-  
-  if (timestamp) {
-    date = [NSDate dateWithTimeIntervalSince1970:timestamp.doubleValue / 1000.0];
-  } else if (dateKey) {
-    date = self.variables[dateKey];
-  } else {
-    date = [NSDate date];  // Current date
-  }
-  
-  if (!date) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:26
-                             userInfo:@{NSLocalizedDescriptionKey: @"No valid date found for formatDate"}];
-    return NO;
-  }
-  
-  NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-  formatter.dateFormat = format;
-  
-  NSString *result = [formatter stringFromDate:date];
-  self.results[key] = result;
-  self.variables[key] = result;
-  
-  return YES;
-}
-
-- (BOOL)executeMath:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *operation = step[@"operation"];  // add, subtract, multiply, divide, mod
-  NSNumber *a = step[@"a"];
-  NSNumber *b = step[@"b"];
-  NSString *key = step[@"as"];
-  
-  if (!operation || !a || !b || !key) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:27
-                             userInfo:@{NSLocalizedDescriptionKey: @"'operation', 'a', 'b', and 'as' required for math"}];
-    return NO;
-  }
-  
-  double result = 0;
-  
-  if ([operation isEqualToString:@"add"]) {
-    result = a.doubleValue + b.doubleValue;
-  } else if ([operation isEqualToString:@"subtract"]) {
-    result = a.doubleValue - b.doubleValue;
-  } else if ([operation isEqualToString:@"multiply"]) {
-    result = a.doubleValue * b.doubleValue;
-  } else if ([operation isEqualToString:@"divide"]) {
-    if (b.doubleValue == 0) {
-      *error = [NSError errorWithDomain:@"FBScriptExecutor" code:28
-                               userInfo:@{NSLocalizedDescriptionKey: @"Division by zero"}];
-      return NO;
-    }
-    result = a.doubleValue / b.doubleValue;
-  } else if ([operation isEqualToString:@"mod"]) {
-    result = fmod(a.doubleValue, b.doubleValue);
-  }
-  
-  self.variables[key] = @(result);
-  self.results[key] = [NSString stringWithFormat:@"%g", result];
-  
-  return YES;
-}
-
-#pragma mark - Control Flow
-
-- (BOOL)evaluateCondition:(NSDictionary *)step
-{
-  NSString *condition = step[@"condition"];
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *text = step[@"text"];
-  NSString *key = step[@"key"];
-  NSString *value = step[@"value"];
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 2.0;
-  
-  XCUIApplication *app = [self getTargetApp];
-  
-  if ([condition isEqualToString:@"exists"]) {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    return (element && element.exists);
-    
-  } else if ([condition isEqualToString:@"notExists"]) {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    return (!element || !element.exists);
-    
-  } else if ([condition isEqualToString:@"visible"]) {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    return (element && element.exists && element.isHittable);
-    
-  } else if ([condition isEqualToString:@"waitExists"]) {
-    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-    while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-      XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-      if (element && element.exists) return YES;
-      [NSThread sleepForTimeInterval:0.1];
-    }
-    return NO;
-    
-  } else if ([condition isEqualToString:@"resultEquals"]) {
-    NSString *storedValue = self.results[key];
-    return [storedValue isEqualToString:value];
-    
-  } else if ([condition isEqualToString:@"resultNotEquals"]) {
-    NSString *storedValue = self.results[key];
-    return ![storedValue isEqualToString:value];
-    
-  } else if ([condition isEqualToString:@"resultContains"]) {
-    NSString *storedValue = self.results[key];
-    return storedValue && [storedValue containsString:value];
-    
-  } else if ([condition isEqualToString:@"resultGreaterThan"]) {
-    NSNumber *storedValue = @([self.results[key] doubleValue]);
-    NSNumber *compareValue = @([value doubleValue]);
-    return [storedValue compare:compareValue] == NSOrderedDescending;
-    
-  } else if ([condition isEqualToString:@"resultLessThan"]) {
-    NSNumber *storedValue = @([self.results[key] doubleValue]);
-    NSNumber *compareValue = @([value doubleValue]);
-    return [storedValue compare:compareValue] == NSOrderedAscending;
-    
-  } else if ([condition isEqualToString:@"true"]) {
-    return YES;
-    
-  } else if ([condition isEqualToString:@"false"]) {
-    return NO;
-  }
-  
-#if !TARGET_OS_TV
-  if ([condition isEqualToString:@"textVisible"]) {
-    UIImage *screenshot = [self captureScreenshot];
-    CGPoint point = [self findTextInImage:screenshot text:text];
-    return !CGPointEqualToPoint(point, CGPointZero);
-    
-  } else if ([condition isEqualToString:@"textNotVisible"]) {
-    UIImage *screenshot = [self captureScreenshot];
-    CGPoint point = [self findTextInImage:screenshot text:text];
-    return CGPointEqualToPoint(point, CGPointZero);
-  }
-#endif
-  
-  return NO;
-}
-
-- (BOOL)executeIf:(NSDictionary *)step error:(NSError **)error
-{
-  NSArray *thenSteps = step[@"then"];
-  NSArray *elseSteps = step[@"else"];
-  
-  BOOL conditionMet = [self evaluateCondition:step];
-  
-  NSArray *stepsToExecute = conditionMet ? thenSteps : elseSteps;
-  
-  if (stepsToExecute && [stepsToExecute isKindOfClass:[NSArray class]] && stepsToExecute.count > 0) {
-    for (NSDictionary *subStep in stepsToExecute) {
-      if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-      if (self.shouldBreak || self.shouldContinue) break;
-      
-      NSError *subError = nil;
-      BOOL success = [self executeStep:subStep error:&subError];
-      
-      if (!success) {
-        NSNumber *optional = subStep[@"optional"];
-        if (optional && optional.boolValue) continue;
-        *error = subError;
-        return NO;
-      }
-    }
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeWhile:(NSDictionary *)step error:(NSError **)error
-{
-  NSArray *doSteps = step[@"do"];
-  NSNumber *maxIterations = step[@"maxIterations"] ?: @100;
-  NSTimeInterval interval = [step[@"interval"] doubleValue] ?: 0.1;
-  
-  if (!doSteps || ![doSteps isKindOfClass:[NSArray class]]) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:29
-                             userInfo:@{NSLocalizedDescriptionKey: @"'do' steps array required for while action"}];
-    return NO;
-  }
-  
-  NSInteger iterations = 0;
-  
-  while (iterations < maxIterations.integerValue) {
-    if (!self.evaluateCondition:step]) break;
-    if (self.shouldBreak) {
-      self.shouldBreak = NO;
-      break;
-    }
-    
-    iterations++;
-    self.variables[@"_iteration"] = @(iterations);
-    
-    for (NSDictionary *subStep in doSteps) {
-      if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-      if (self.shouldBreak) break;
-      if (self.shouldContinue) {
-        self.shouldContinue = NO;
-        break;
-      }
-      
-      NSError *subError = nil;
-      BOOL success = [self executeStep:subStep error:&subError];
-      
-      if (!success) {
-        NSNumber *optional = subStep[@"optional"];
-        if (optional && optional.boolValue) continue;
-        *error = subError;
-        return NO;
-      }
-    }
-    
-    [NSThread sleepForTimeInterval:interval];
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeRepeat:(NSDictionary *)step error:(NSError **)error
-{
-  NSNumber *times = step[@"times"];
-  NSArray *doSteps = step[@"do"];
-  
-  if (!times) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:30
-                             userInfo:@{NSLocalizedDescriptionKey: @"'times' required for repeat action"}];
-    return NO;
-  }
-  
-  if (!doSteps || ![doSteps isKindOfClass:[NSArray class]]) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:29
-                             userInfo:@{NSLocalizedDescriptionKey: @"'do' steps array required for repeat action"}];
-    return NO;
-  }
-  
-  for (NSInteger i = 0; i < times.integerValue; i++) {
-    if (self.shouldBreak) {
-      self.shouldBreak = NO;
-      break;
-    }
-    
-    self.variables[@"_index"] = @(i);
-    self.variables[@"_iteration"] = @(i + 1);
-    
-    for (NSDictionary *subStep in doSteps) {
-      if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-      if (self.shouldBreak) break;
-      if (self.shouldContinue) {
-        self.shouldContinue = NO;
-        break;
-      }
-      
-      NSError *subError = nil;
-      BOOL success = [self executeStep:subStep error:&subError];
-      
-      if (!success) {
-        NSNumber *optional = subStep[@"optional"];
-        if (optional && optional.boolValue) continue;
-        *error = subError;
-        return NO;
-      }
-    }
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeForEach:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *itemsKey = step[@"items"];
-  NSString *itemVar = step[@"as"] ?: @"item";
-  NSString *indexVar = step[@"indexAs"] ?: @"index";
-  NSArray *doSteps = step[@"do"];
-  
-  if (!itemsKey || !doSteps) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:31
-                             userInfo:@{NSLocalizedDescriptionKey: @"'items' and 'do' required for forEach"}];
-    return NO;
-  }
-  
-  id items = self.variables[itemsKey];
-  if (![items isKindOfClass:[NSArray class]]) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:32
-                             userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Variable '%@' is not an array", itemsKey]}];
-    return NO;
-  }
-  
-  NSArray *itemsArray = (NSArray *)items;
-  
-  for (NSInteger i = 0; i < itemsArray.count; i++) {
-    if (self.shouldBreak) {
-      self.shouldBreak = NO;
-      break;
-    }
-    
-    id item = itemsArray[i];
-    self.variables[itemVar] = item;
-    self.variables[indexVar] = @(i);
-    
-    // If item is a dictionary, spread its values as variables
-    if ([item isKindOfClass:[NSDictionary class]]) {
-      NSDictionary *itemDict = (NSDictionary *)item;
-      for (NSString *key in itemDict) {
-        self.variables[[NSString stringWithFormat:@"%@_%@", itemVar, key]] = itemDict[key];
-      }
-    }
-    
-    for (NSDictionary *subStep in doSteps) {
-      if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-      if (self.shouldBreak) break;
-      if (self.shouldContinue) {
-        self.shouldContinue = NO;
-        break;
-      }
-      
-      NSError *subError = nil;
-      BOOL success = [self executeStep:subStep error:&subError];
-      
-      if (!success) {
-        NSNumber *optional = subStep[@"optional"];
-        if (optional && optional.boolValue) continue;
-        *error = subError;
-        return NO;
-      }
-    }
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeTry:(NSDictionary *)step error:(NSError **)error
-{
-  NSArray *trySteps = step[@"try"] ?: step[@"do"];
-  NSArray *catchSteps = step[@"catch"];
-  NSArray *finallySteps = step[@"finally"];
-  
-  if (!trySteps) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:33
-                             userInfo:@{NSLocalizedDescriptionKey: @"'try' or 'do' required for try action"}];
-    return NO;
-  }
-  
-  BOOL trySucceeded = YES;
-  NSError *tryError = nil;
-  
-  // Execute try block
-  for (NSDictionary *subStep in trySteps) {
-    if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-    
-    NSError *subError = nil;
-    BOOL success = [self executeStep:subStep error:&subError];
-    
-    if (!success) {
-      trySucceeded = NO;
-      tryError = subError;
-      self.variables[@"_error"] = subError.localizedDescription;
-      break;
-    }
-  }
-  
-  // Execute catch block if try failed
-  if (!trySucceeded && catchSteps && [catchSteps isKindOfClass:[NSArray class]]) {
-    for (NSDictionary *subStep in catchSteps) {
-      if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-      
-      NSError *subError = nil;
-      [self executeStep:subStep error:&subError];
-      // Ignore errors in catch block
-    }
-  }
-  
-  // Execute finally block always
-  if (finallySteps && [finallySteps isKindOfClass:[NSArray class]]) {
-    for (NSDictionary *subStep in finallySteps) {
-      if (![subStep isKindOfClass:[NSDictionary class]]) continue;
-      
-      NSError *subError = nil;
-      [self executeStep:subStep error:&subError];
-      // Ignore errors in finally block
-    }
-  }
-  
-  // Try/catch doesn't propagate errors by default
-  NSNumber *propagateError = step[@"propagateError"];
-  if (propagateError && propagateError.boolValue && !trySucceeded) {
-    *error = tryError;
-    return NO;
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeReturn:(NSDictionary *)step error:(NSError **)error
-{
-  // Set return value if provided
-  id value = step[@"value"];
-  if (value) {
-    self.results[@"_returnValue"] = [value isKindOfClass:[NSString class]] ? value : [value description];
-  }
-  
-  // Set break flag to exit current execution
-  self.shouldBreak = YES;
-  return YES;
-}
-
-#pragma mark - Assertions
-
-- (BOOL)executeAssert:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *message = step[@"message"] ?: @"Assertion failed";
-  
-  BOOL conditionMet = [self evaluateCondition:step];
-  
-  if (!conditionMet) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:34
-                             userInfo:@{NSLocalizedDescriptionKey: message}];
-    return NO;
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeAssertExists:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *message = step[@"message"] ?: [NSString stringWithFormat:@"Element '%@' does not exist", selector];
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 5.0;
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    if (element && element.exists) {
-      return YES;
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:35
-                           userInfo:@{NSLocalizedDescriptionKey: message}];
-  return NO;
-}
-
-- (BOOL)executeAssertNotExists:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *message = step[@"message"] ?: [NSString stringWithFormat:@"Element '%@' exists but should not", selector];
-  
-  XCUIApplication *app = [self getTargetApp];
-  XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-  
-  if (element && element.exists) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:36
-                             userInfo:@{NSLocalizedDescriptionKey: message}];
-    return NO;
-  }
-  
-  return YES;
-}
-
-- (BOOL)executeAssertText:(NSDictionary *)step error:(NSError **)error
-{
-  NSString *selector = step[@"selector"];
-  NSString *selectorType = step[@"selectorType"];
-  NSString *expected = step[@"expected"];
-  NSString *contains = step[@"contains"];
-  NSString *message = step[@"message"];
-  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 5.0;
-  
-  if (!selector || (!expected && !contains)) {
-    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:37
-                             userInfo:@{NSLocalizedDescriptionKey: @"'selector' and ('expected' or 'contains') required for assertText"}];
-    return NO;
-  }
-  
-  XCUIApplication *app = [self getTargetApp];
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    XCUIElement *element = [self findElementWithSelector:selector selectorType:selectorType inApp:app];
-    if (element && element.exists) {
-      NSString *actualText = element.label ?: [element valueForKey:@"value"] ?: @"";
-      
-      if (expected && [actualText isEqualToString:expected]) {
-        return YES;
-      }
-      
-      if (contains && [actualText containsString:contains]) {
-        return YES;
-      }
-    }
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  if (!message) {
-    if (expected) {
-      message = [NSString stringWithFormat:@"Element text does not equal '%@'", expected];
-    } else {
-      message = [NSString stringWithFormat:@"Element text does not contain '%@'", contains];
-    }
-  }
-  
-  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:38
-                           userInfo:@{NSLocalizedDescriptionKey: message}];
-  return NO;
 }
 
 #pragma mark - Vision/OCR Actions
@@ -2120,6 +705,68 @@
 {
   XCUIScreenshot *screenshot = XCUIScreen.mainScreen.screenshot;
   return screenshot.image;
+}
+
+- (BOOL)executeClickText:(NSDictionary *)step error:(NSError **)error
+{
+  NSString *searchText = step[@"text"];
+  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
+  
+  if (!searchText) {
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:20
+                             userInfo:@{NSLocalizedDescriptionKey: @"'text' required for clickText"}];
+    return NO;
+  }
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    UIImage *screenshot = [self captureScreenshot];
+    CGPoint point = [self findTextInImage:screenshot text:searchText];
+    
+    if (!CGPointEqualToPoint(point, CGPointZero)) {
+      XCUIApplication *app = [self getTargetApp];
+      XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
+                               coordinateWithOffset:CGVectorMake(point.x, point.y)];
+      [coord tap];
+      return YES;
+    }
+    
+    [NSThread sleepForTimeInterval:0.2];
+  }
+  
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:21
+                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Text '%@' not found on screen within %.1fs", searchText, timeout]}];
+  return NO;
+}
+
+- (BOOL)executeWaitText:(NSDictionary *)step error:(NSError **)error
+{
+  NSString *searchText = step[@"text"];
+  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
+  
+  if (!searchText) {
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:20
+                             userInfo:@{NSLocalizedDescriptionKey: @"'text' required for waitText"}];
+    return NO;
+  }
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    UIImage *screenshot = [self captureScreenshot];
+    CGPoint point = [self findTextInImage:screenshot text:searchText];
+    
+    if (!CGPointEqualToPoint(point, CGPointZero)) {
+      return YES;
+    }
+    
+    [NSThread sleepForTimeInterval:0.2];
+  }
+  
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:22
+                           userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Text '%@' not found on screen within %.1fs", searchText, timeout]}];
+  return NO;
 }
 
 - (CGPoint)findTextInImage:(UIImage *)image text:(NSString *)searchText
@@ -2159,7 +806,8 @@
   request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
   request.usesLanguageCorrection = YES;
   
-  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage options:@{}];
+  CGImageRef cgImage = image.CGImage;
+  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:cgImage options:@{}];
   
   NSError *performError = nil;
   [handler performRequests:@[request] error:&performError];
@@ -2169,10 +817,1010 @@
   return foundPoint;
 }
 
-- (NSArray<NSDictionary *> *)findAllTextInImage:(UIImage *)image
+- (BOOL)executeReadRegion:(NSDictionary *)step error:(NSError **)error
 {
-  __block NSMutableArray *results = [NSMutableArray array];
+  NSString *key = step[@"as"] ?: @"regionText";
+  
+  UIImage *screenshot = [self captureScreenshot];
+  UIImage *targetImage = screenshot;
+  
+  // Crop if region specified
+  NSNumber *regionX = step[@"regionX"];
+  NSNumber *regionY = step[@"regionY"];
+  NSNumber *regionWidth = step[@"regionWidth"];
+  NSNumber *regionHeight = step[@"regionHeight"];
+  
+  if (regionX && regionY && regionWidth && regionHeight) {
+    CGRect cropRect = CGRectMake(
+      regionX.doubleValue,
+      regionY.doubleValue,
+      regionWidth.doubleValue,
+      regionHeight.doubleValue
+    );
+    CGImageRef croppedCGImage = CGImageCreateWithImageInRect(screenshot.CGImage, cropRect);
+    if (croppedCGImage) {
+      targetImage = [UIImage imageWithCGImage:croppedCGImage];
+      CGImageRelease(croppedCGImage);
+    }
+  }
+  
+  NSString *recognizedText = [self recognizeTextInImage:targetImage];
+  self.results[key] = recognizedText ?: @"";
+  return YES;
+}
+
+- (NSString *)recognizeTextInImage:(UIImage *)image
+{
+  __block NSMutableString *result = [NSMutableString string];
   
   dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
   
-  VNRecognizeTextRequest *request 
+  VNRecognizeTextRequest *request = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *request, NSError *error) {
+    if (error) {
+      dispatch_semaphore_signal(semaphore);
+      return;
+    }
+    
+    NSArray<VNRecognizedTextObservation *> *observations = request.results;
+    
+    for (VNRecognizedTextObservation *observation in observations) {
+      NSArray<VNRecognizedText *> *candidates = [observation topCandidates:1];
+      if (candidates.count > 0) {
+        [result appendString:candidates.firstObject.string];
+        [result appendString:@" "];
+      }
+    }
+    
+    dispatch_semaphore_signal(semaphore);
+  }];
+  
+  request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+  request.usesLanguageCorrection = YES;
+  
+  VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:image.CGImage options:@{}];
+  
+  NSError *performError = nil;
+  [handler performRequests:@[request] error:&performError];
+  
+  dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+  
+  return [result stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+- (BOOL)executeClickImage:(NSDictionary *)step error:(NSError **)error
+{
+  NSString *imageBase64 = step[@"imageBase64"];
+  NSTimeInterval timeout = [step[@"timeout"] doubleValue] ?: 10.0;
+  CGFloat confidence = [step[@"confidence"] doubleValue] ?: 0.8;
+  
+  if (!imageBase64) {
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:23
+                             userInfo:@{NSLocalizedDescriptionKey: @"'imageBase64' required for clickImage"}];
+    return NO;
+  }
+  
+  NSData *templateData = [[NSData alloc] initWithBase64EncodedString:imageBase64 options:0];
+  UIImage *templateImage = [UIImage imageWithData:templateData];
+  
+  if (!templateImage) {
+    *error = [NSError errorWithDomain:@"FBScriptExecutor" code:24
+                             userInfo:@{NSLocalizedDescriptionKey: @"Cannot decode template image from base64"}];
+    return NO;
+  }
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    UIImage *screenshot = [self captureScreenshot];
+    CGPoint point = [self findTemplateInImage:screenshot template:templateImage confidence:confidence];
+    
+    if (!CGPointEqualToPoint(point, CGPointZero)) {
+      XCUIApplication *app = [self getTargetApp];
+      XCUICoordinate *coord = [[app coordinateWithNormalizedOffset:CGVectorMake(0, 0)]
+                               coordinateWithOffset:CGVectorMake(point.x, point.y)];
+      [coord tap];
+      return YES;
+    }
+    
+    [NSThread sleepForTimeInterval:0.2];
+  }
+  
+  *error = [NSError errorWithDomain:@"FBScriptExecutor" code:25
+                           userInfo:@{NSLocalizedDescriptionKey: @"Template image not found on screen"}];
+  return NO;
+}
+
+- (CGPoint)findTemplateInImage:(UIImage *)screenshot template:(UIImage *)templateImage confidence:(CGFloat)minConfidence
+{
+  CGImageRef screenshotCG = screenshot.CGImage;
+  CGImageRef templateCG = templateImage.CGImage;
+  
+  size_t screenshotWidth = CGImageGetWidth(screenshotCG);
+  size_t screenshotHeight = CGImageGetHeight(screenshotCG);
+  size_t templateWidth = CGImageGetWidth(templateCG);
+  size_t templateHeight = CGImageGetHeight(templateCG);
+  
+  if (templateWidth > screenshotWidth || templateHeight > screenshotHeight) {
+    return CGPointZero;
+  }
+  
+  CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+  
+  size_t bytesPerPixel = 4;
+  size_t screenshotBytesPerRow = bytesPerPixel * screenshotWidth;
+  size_t templateBytesPerRow = bytesPerPixel * templateWidth;
+  
+  unsigned char *screenshotData = (unsigned char *)calloc(screenshotHeight * screenshotBytesPerRow, 1);
+  unsigned char *templateData = (unsigned char *)calloc(templateHeight * templateBytesPerRow, 1);
+  
+  CGContextRef screenshotContext = CGBitmapContextCreate(screenshotData, screenshotWidth, screenshotHeight,
+                                                          8, screenshotBytesPerRow, colorSpace,
+                                                          kCGImageAlphaPremultipliedLast);
+  CGContextRef templateContext = CGBitmapContextCreate(templateData, templateWidth, templateHeight,
+                                                        8, templateBytesPerRow, colorSpace,
+                                                        kCGImageAlphaPremultipliedLast);
+  
+  CGContextDrawImage(screenshotContext, CGRectMake(0, 0, screenshotWidth, screenshotHeight), screenshotCG);
+  CGContextDrawImage(templateContext, CGRectMake(0, 0, templateWidth, templateHeight), templateCG);
+  
+  CGPoint bestMatch = CGPointZero;
+  CGFloat bestScore = 0;
+  
+  size_t stepSize = 4;
+  
+  for (size_t y = 0; y <= screenshotHeight - templateHeight; y += stepSize) {
+    for (size_t x = 0; x <= screenshotWidth - templateWidth; x += stepSize) {
+      CGFloat score = [self compareRegionAtX:x y:y
+                              screenshotData:screenshotData
+                             screenshotWidth:screenshotWidth
+                                templateData:templateData
+                               templateWidth:templateWidth
+                              templateHeight:templateHeight];
+      
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = CGPointMake(x + templateWidth / 2.0, y + templateHeight / 2.0);
+      }
+    }
+  }
+  
+  CGContextRelease(screenshotContext);
+  CGContextRelease(templateContext);
+  CGColorSpaceRelease(colorSpace);
+  free(screenshotData);
+  free(templateData);
+  
+  if (bestScore >= minConfidence) {
+    return bestMatch;
+  }
+  
+  return CGPointZero;
+}
+
+- (CGFloat)compareRegionAtX:(size_t)offsetX y:(size_t)offsetY
+             screenshotData:(unsigned char *)screenshot
+            screenshotWidth:(size_t)screenshotWidth
+               templateData:(unsigned char *)templateData
+              templateWidth:(size_t)templateWidth
+             templateHeight:(size_t)templateHeight
+{
+  size_t bytesPerPixel = 4;
+  size_t screenshotBytesPerRow = bytesPerPixel * screenshotWidth;
+  size_t templateBytesPerRow = bytesPerPixel * templateWidth;
+  
+  CGFloat totalScore = 0;
+  size_t sampleCount = 0;
+  size_t sampleStep = 4;
+  
+  for (size_t ty = 0; ty < templateHeight; ty += sampleStep) {
+    for (size_t tx = 0; tx < templateWidth; tx += sampleStep) {
+      size_t sx = offsetX + tx;
+      size_t sy = offsetY + ty;
+      
+      size_t screenshotIndex = sy * screenshotBytesPerRow + sx * bytesPerPixel;
+      size_t templateIndex = ty * templateBytesPerRow + tx * bytesPerPixel;
+      
+      int sr = screenshot[screenshotIndex];
+      int sg = screenshot[screenshotIndex + 1];
+      int sb = screenshot[screenshotIndex + 2];
+      
+      int tr = templateData[templateIndex];
+      int tg = templateData[templateIndex + 1];
+      int tb = templateData[templateIndex + 2];
+      
+      CGFloat diff = (abs(sr - tr) + abs(sg - tg) + abs(sb - tb)) / (3.0 * 255.0);
+      totalScore += (1.0 - diff);
+      sampleCount++;
+    }
+  }
+  
+  return sampleCount > 0 ? totalScore / sampleCount : 0;
+}
+
+#endif // !TARGET_OS_TV
+
+@end
+
+#pragma mark - FBCustomCommands Implementation
+
+@implementation FBCustomCommands
+
++ (NSArray *)routes
+{
+  return
+  @[
+    [[FBRoute POST:@"/timeouts"] respondWithTarget:self action:@selector(handleTimeouts:)],
+    [[FBRoute POST:@"/wda/homescreen"].withoutSession respondWithTarget:self action:@selector(handleHomescreenCommand:)],
+    [[FBRoute POST:@"/wda/deactivateApp"] respondWithTarget:self action:@selector(handleDeactivateAppCommand:)],
+    [[FBRoute POST:@"/wda/keyboard/dismiss"] respondWithTarget:self action:@selector(handleDismissKeyboardCommand:)],
+    [[FBRoute POST:@"/wda/lock"].withoutSession respondWithTarget:self action:@selector(handleLock:)],
+    [[FBRoute POST:@"/wda/lock"] respondWithTarget:self action:@selector(handleLock:)],
+    [[FBRoute POST:@"/wda/unlock"].withoutSession respondWithTarget:self action:@selector(handleUnlock:)],
+    [[FBRoute POST:@"/wda/unlock"] respondWithTarget:self action:@selector(handleUnlock:)],
+    [[FBRoute GET:@"/wda/locked"].withoutSession respondWithTarget:self action:@selector(handleIsLocked:)],
+    [[FBRoute GET:@"/wda/locked"] respondWithTarget:self action:@selector(handleIsLocked:)],
+    [[FBRoute GET:@"/wda/screen"] respondWithTarget:self action:@selector(handleGetScreen:)],
+    [[FBRoute GET:@"/wda/screen"].withoutSession respondWithTarget:self action:@selector(handleGetScreen:)],
+    [[FBRoute GET:@"/wda/activeAppInfo"] respondWithTarget:self action:@selector(handleActiveAppInfo:)],
+    [[FBRoute GET:@"/wda/activeAppInfo"].withoutSession respondWithTarget:self action:@selector(handleActiveAppInfo:)],
+#if !TARGET_OS_TV
+    [[FBRoute POST:@"/wda/setPasteboard"] respondWithTarget:self action:@selector(handleSetPasteboard:)],
+    [[FBRoute POST:@"/wda/setPasteboard"].withoutSession respondWithTarget:self action:@selector(handleSetPasteboard:)],
+    [[FBRoute POST:@"/wda/getPasteboard"] respondWithTarget:self action:@selector(handleGetPasteboard:)],
+    [[FBRoute POST:@"/wda/getPasteboard"].withoutSession respondWithTarget:self action:@selector(handleGetPasteboard:)],
+    [[FBRoute GET:@"/wda/batteryInfo"] respondWithTarget:self action:@selector(handleGetBatteryInfo:)],
+#endif
+    [[FBRoute POST:@"/wda/pressButton"] respondWithTarget:self action:@selector(handlePressButtonCommand:)],
+    [[FBRoute POST:@"/wda/performAccessibilityAudit"] respondWithTarget:self action:@selector(handlePerformAccessibilityAudit:)],
+    [[FBRoute POST:@"/wda/performIoHidEvent"] respondWithTarget:self action:@selector(handlePeformIOHIDEvent:)],
+    [[FBRoute POST:@"/wda/expectNotification"] respondWithTarget:self action:@selector(handleExpectNotification:)],
+    [[FBRoute POST:@"/wda/siri/activate"] respondWithTarget:self action:@selector(handleActivateSiri:)],
+    [[FBRoute POST:@"/wda/apps/launchUnattached"].withoutSession respondWithTarget:self action:@selector(handleLaunchUnattachedApp:)],
+    [[FBRoute GET:@"/wda/device/info"] respondWithTarget:self action:@selector(handleGetDeviceInfo:)],
+    [[FBRoute POST:@"/wda/resetAppAuth"] respondWithTarget:self action:@selector(handleResetAppAuth:)],
+    [[FBRoute GET:@"/wda/device/info"].withoutSession respondWithTarget:self action:@selector(handleGetDeviceInfo:)],
+    [[FBRoute POST:@"/wda/device/appearance"].withoutSession respondWithTarget:self action:@selector(handleSetDeviceAppearance:)],
+    [[FBRoute GET:@"/wda/device/location"] respondWithTarget:self action:@selector(handleGetLocation:)],
+    [[FBRoute GET:@"/wda/device/location"].withoutSession respondWithTarget:self action:@selector(handleGetLocation:)],
+#if !TARGET_OS_TV
+#if __clang_major__ >= 15
+    [[FBRoute POST:@"/wda/element/:uuid/keyboardInput"] respondWithTarget:self action:@selector(handleKeyboardInput:)],
+#endif
+    [[FBRoute POST:@"/wda/media/import"] respondWithTarget:self action:@selector(handleMediaImport:)],
+    [[FBRoute POST:@"/wda/media/import"].withoutSession respondWithTarget:self action:@selector(handleMediaImport:)],
+    [[FBRoute POST:@"/wda/media/pop"] respondWithTarget:self action:@selector(handleMediaPop:)],
+    [[FBRoute POST:@"/wda/media/pop"].withoutSession respondWithTarget:self action:@selector(handleMediaPop:)],
+    [[FBRoute GET:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleGetSimulatedLocation:)],
+    [[FBRoute GET:@"/wda/simulatedLocation"].withoutSession respondWithTarget:self action:@selector(handleGetSimulatedLocation:)],
+    [[FBRoute POST:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleSetSimulatedLocation:)],
+    [[FBRoute POST:@"/wda/simulatedLocation"].withoutSession respondWithTarget:self action:@selector(handleSetSimulatedLocation:)],
+    [[FBRoute DELETE:@"/wda/simulatedLocation"] respondWithTarget:self action:@selector(handleClearSimulatedLocation:)],
+    [[FBRoute DELETE:@"/wda/simulatedLocation"].withoutSession respondWithTarget:self action:@selector(handleClearSimulatedLocation:)],
+    // Script execution endpoint
+    [[FBRoute POST:@"/wda/script"] respondWithTarget:self action:@selector(handleScript:)],
+    [[FBRoute POST:@"/wda/script"].withoutSession respondWithTarget:self action:@selector(handleScript:)],
+#endif
+    [[FBRoute OPTIONS:@"/*"].withoutSession respondWithTarget:self action:@selector(handlePingCommand:)],
+  ];
+}
+
+#pragma mark - Script Execution
+
++ (id<FBResponsePayload>)handleScript:(FBRouteRequest *)request
+{
+  NSArray *stepsArray = request.arguments[@"steps"];
+  
+  if (!stepsArray || ![stepsArray isKindOfClass:[NSArray class]]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'steps' array is required"
+                                                                       traceback:nil]);
+  }
+  
+  if (stepsArray.count == 0) {
+    return FBResponseWithObject(@{
+      @"success": @YES,
+      @"results": @{},
+      @"stoppedAt": [NSNull null],
+      @"error": [NSNull null]
+    });
+  }
+  
+  for (id step in stepsArray) {
+    if (![step isKindOfClass:[NSDictionary class]]) {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Each step must be a dictionary"
+                                                                         traceback:nil]);
+    }
+  }
+  
+  FBScriptExecutor *executor = [[FBScriptExecutor alloc] init];
+  NSDictionary *result = [executor executeSteps:stepsArray];
+  
+  return FBResponseWithObject(result);
+}
+
+#pragma mark - Original Commands
+
++ (id<FBResponsePayload>)handleHomescreenCommand:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![[XCUIDevice sharedDevice] fb_goToHomescreenWithError:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description
+                                                               traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleDeactivateAppCommand:(FBRouteRequest *)request
+{
+  NSNumber *requestedDuration = request.arguments[@"duration"];
+  NSTimeInterval duration = (requestedDuration ? requestedDuration.doubleValue : 3.);
+  NSError *error;
+  if (![request.session.activeApplication fb_deactivateWithDuration:duration error:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleTimeouts:(FBRouteRequest *)request
+{
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleDismissKeyboardCommand:(FBRouteRequest *)request
+{
+  NSError *error;
+  BOOL isDismissed = [request.session.activeApplication fb_dismissKeyboardWithKeyNames:request.arguments[@"keyNames"]
+                                                                                 error:&error];
+  return isDismissed
+  ? FBResponseWithOK()
+  : FBResponseWithStatus([FBCommandStatus invalidElementStateErrorWithMessage:error.description
+                                                                    traceback:nil]);
+}
+
++ (id<FBResponsePayload>)handlePingCommand:(FBRouteRequest *)request
+{
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleGetScreen:(FBRouteRequest *)request
+{
+  XCUIApplication *app = XCUIApplication.fb_systemApplication;
+  XCUIElement *mainStatusBar = app.statusBars.allElementsBoundByIndex.firstObject;
+  CGSize statusBarSize = (nil == mainStatusBar) ? CGSizeZero : mainStatusBar.frame.size;
+
+#if TARGET_OS_TV
+  CGSize screenSize = app.frame.size;
+#else
+  CGSize screenSize = FBAdjustDimensionsForApplication(app.wdFrame.size, app.interfaceOrientation);
+#endif
+
+  return FBResponseWithObject(@{
+    @"screenSize": @{@"width": @(screenSize.width), @"height": @(screenSize.height)},
+    @"statusBarSize": @{@"width": @(statusBarSize.width), @"height": @(statusBarSize.height)},
+    @"scale": @([FBScreen scale]),
+  });
+}
+
++ (id<FBResponsePayload>)handleLock:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![[XCUIDevice sharedDevice] fb_lockScreen:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleIsLocked:(FBRouteRequest *)request
+{
+  BOOL isLocked = [XCUIDevice sharedDevice].fb_isScreenLocked;
+  return FBResponseWithObject(isLocked ? @YES : @NO);
+}
+
++ (id<FBResponsePayload>)handleUnlock:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![[XCUIDevice sharedDevice] fb_unlockScreen:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleActiveAppInfo:(FBRouteRequest *)request
+{
+  XCUIApplication *app = request.session.activeApplication ?: XCUIApplication.fb_activeApplication;
+  return FBResponseWithObject(@{
+    @"pid": @(app.processID),
+    @"bundleId": app.bundleID,
+    @"name": app.identifier,
+    @"processArguments": [self processArguments:app],
+  });
+}
+
++ (NSDictionary *)processArguments:(XCUIApplication *)app
+{
+  if (app == nil) {
+    return @{};
+  }
+  return @{
+    @"args": app.launchArguments,
+    @"env": app.launchEnvironment
+  };
+}
+
+#if !TARGET_OS_TV
++ (id<FBResponsePayload>)handleSetPasteboard:(FBRouteRequest *)request
+{
+  NSString *contentType = request.arguments[@"contentType"] ?: @"plaintext";
+  NSData *content = [[NSData alloc] initWithBase64EncodedString:(NSString *)request.arguments[@"content"]
+                                                        options:NSDataBase64DecodingIgnoreUnknownCharacters];
+  if (nil == content) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot decode the pasteboard content from base64" traceback:nil]);
+  }
+  NSError *error;
+  if (![FBPasteboard setData:content forType:contentType error:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleGetPasteboard:(FBRouteRequest *)request
+{
+  NSString *contentType = request.arguments[@"contentType"] ?: @"plaintext";
+  NSError *error;
+  id result = [FBPasteboard dataForType:contentType error:&error];
+  if (nil == result) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithObject([result base64EncodedStringWithOptions:0]);
+}
+
++ (id<FBResponsePayload>)handleGetBatteryInfo:(FBRouteRequest *)request
+{
+  if (![[UIDevice currentDevice] isBatteryMonitoringEnabled]) {
+    [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
+  }
+  return FBResponseWithObject(@{
+    @"level": @([UIDevice currentDevice].batteryLevel),
+    @"state": @([UIDevice currentDevice].batteryState)
+  });
+}
+#endif
+
++ (id<FBResponsePayload>)handlePressButtonCommand:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_pressButton:(id)request.arguments[@"name"]
+                                   forDuration:(NSNumber *)request.arguments[@"duration"]
+                                         error:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleActivateSiri:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_activateSiriVoiceRecognitionWithText:(id)request.arguments[@"text"] error:&error]) {
+    return FBResponseWithUnknownError(error);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handlePeformIOHIDEvent:(FBRouteRequest *)request
+{
+  NSNumber *page = request.arguments[@"page"];
+  NSNumber *usage = request.arguments[@"usage"];
+  NSNumber *duration = request.arguments[@"duration"];
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_performIOHIDEventWithPage:page.unsignedIntValue
+                                                       usage:usage.unsignedIntValue
+                                                    duration:duration.doubleValue
+                                                       error:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleLaunchUnattachedApp:(FBRouteRequest *)request
+{
+  NSString *bundle = (NSString *)request.arguments[@"bundleId"];
+  if ([FBUnattachedAppLauncher launchAppWithBundleId:bundle]) {
+    return FBResponseWithOK();
+  }
+  return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"LSApplicationWorkspace failed to launch app" traceback:nil]);
+}
+
++ (id<FBResponsePayload>)handleResetAppAuth:(FBRouteRequest *)request
+{
+  NSNumber *resource = request.arguments[@"resource"];
+  if (nil == resource) {
+    NSString *errMsg = @"The 'resource' argument must be set to a valid resource identifier";
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:errMsg traceback:nil]);
+  }
+  [request.session.activeApplication resetAuthorizationStatusForResource:(XCUIProtectedResource)resource.longLongValue];
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleGetLocation:(FBRouteRequest *)request
+{
+#if TARGET_OS_TV
+  return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"unsupported" traceback:nil]);
+#else
+  CLLocationManager *locationManager = [[CLLocationManager alloc] init];
+  [locationManager setDistanceFilter:kCLHeadingFilterNone];
+  [locationManager setDesiredAccuracy:kCLLocationAccuracyBest];
+  [locationManager setPausesLocationUpdatesAutomatically:NO];
+  [locationManager startUpdatingLocation];
+
+  CLAuthorizationStatus authStatus;
+  if ([locationManager respondsToSelector:@selector(authorizationStatus)]) {
+    NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:[[locationManager class]
+                                                                            instanceMethodSignatureForSelector:@selector(authorizationStatus)]];
+    [invocation setSelector:@selector(authorizationStatus)];
+    [invocation setTarget:locationManager];
+    [invocation invoke];
+    [invocation getReturnValue:&authStatus];
+  } else {
+    authStatus = [CLLocationManager authorizationStatus];
+  }
+
+  return FBResponseWithObject(@{
+    @"authorizationStatus": @(authStatus),
+    @"latitude": @(locationManager.location.coordinate.latitude),
+    @"longitude": @(locationManager.location.coordinate.longitude),
+    @"altitude": @(locationManager.location.altitude),
+  });
+#endif
+}
+
++ (id<FBResponsePayload>)handleExpectNotification:(FBRouteRequest *)request
+{
+  NSString *name = request.arguments[@"name"];
+  if (nil == name) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Notification name argument must be provided" traceback:nil]);
+  }
+  NSNumber *timeout = request.arguments[@"timeout"] ?: @60;
+  NSString *type = request.arguments[@"type"] ?: @"plain";
+
+  XCTWaiterResult result;
+  if ([type isEqualToString:@"plain"]) {
+    result = [FBNotificationsHelper waitForNotificationWithName:name timeout:timeout.doubleValue];
+  } else if ([type isEqualToString:@"darwin"]) {
+    result = [FBNotificationsHelper waitForDarwinNotificationWithName:name timeout:timeout.doubleValue];
+  } else {
+    NSString *message = [NSString stringWithFormat:@"Notification type could only be 'plain' or 'darwin'. Got '%@' instead", type];
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:message traceback:nil]);
+  }
+  if (result != XCTWaiterResultCompleted) {
+    NSString *message = [NSString stringWithFormat:@"Did not receive any expected %@ notifications within %@s", name, timeout];
+    return FBResponseWithStatus([FBCommandStatus timeoutErrorWithMessage:message traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleSetDeviceAppearance:(FBRouteRequest *)request
+{
+  NSString *name = [request.arguments[@"name"] lowercaseString];
+  if (nil == name || !([name isEqualToString:@"light"] || [name isEqualToString:@"dark"])) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"The appearance name must be either 'light' or 'dark'" traceback:nil]);
+  }
+
+  FBUIInterfaceAppearance appearance = [name isEqualToString:@"light"]
+    ? FBUIInterfaceAppearanceLight
+    : FBUIInterfaceAppearanceDark;
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_setAppearance:appearance error:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleGetDeviceInfo:(FBRouteRequest *)request
+{
+  NSString *currentLocale = [[NSLocale autoupdatingCurrentLocale] localeIdentifier];
+
+  NSMutableDictionary *deviceInfo = [NSMutableDictionary dictionaryWithDictionary:@{
+    @"currentLocale": currentLocale,
+    @"timeZone": self.timeZone,
+    @"name": UIDevice.currentDevice.name,
+    @"model": UIDevice.currentDevice.model,
+    @"uuid": [UIDevice.currentDevice.identifierForVendor UUIDString] ?: @"unknown",
+    @"userInterfaceIdiom": @(UIDevice.currentDevice.userInterfaceIdiom),
+    @"userInterfaceStyle": self.userInterfaceStyle,
+#if TARGET_OS_SIMULATOR
+    @"isSimulator": @(YES),
+#else
+    @"isSimulator": @(NO),
+#endif
+  }];
+
+  deviceInfo[@"thermalState"] = @(NSProcessInfo.processInfo.thermalState);
+  return FBResponseWithObject(deviceInfo);
+}
+
++ (NSString *)userInterfaceStyle
+{
+  if (SYSTEM_VERSION_GREATER_THAN_OR_EQUAL_TO(@"15.0")) {
+    NSNumber *appearance = [XCUIDevice.sharedDevice fb_getAppearance];
+    if (appearance != nil) {
+      return [self getAppearanceName:appearance];
+    }
+  }
+
+  static id userInterfaceStyle = nil;
+  static dispatch_once_t styleOnceToken;
+  dispatch_once(&styleOnceToken, ^{
+    if ([UITraitCollection respondsToSelector:NSSelectorFromString(@"currentTraitCollection")]) {
+      id currentTraitCollection = [UITraitCollection performSelector:NSSelectorFromString(@"currentTraitCollection")];
+      if (nil != currentTraitCollection) {
+        userInterfaceStyle = [currentTraitCollection valueForKey:@"userInterfaceStyle"];
+      }
+    }
+  });
+
+  if (nil == userInterfaceStyle) {
+    return @"unsupported";
+  }
+  return [self getAppearanceName:userInterfaceStyle];
+}
+
++ (NSString *)getAppearanceName:(NSNumber *)appearance
+{
+  switch ([appearance longLongValue]) {
+    case FBUIInterfaceAppearanceUnspecified: return @"automatic";
+    case FBUIInterfaceAppearanceLight: return @"light";
+    case FBUIInterfaceAppearanceDark: return @"dark";
+    default: return @"unknown";
+  }
+}
+
++ (NSString *)timeZone
+{
+  NSTimeZone *localTimeZone = [NSTimeZone localTimeZone];
+  NSString *timeZoneAbb = [localTimeZone abbreviation];
+  if (timeZoneAbb == nil) {
+    return [localTimeZone name];
+  }
+  NSString *timeZoneId = [[NSTimeZone timeZoneWithAbbreviation:timeZoneAbb] name];
+  if (timeZoneId != nil) {
+    return timeZoneId;
+  }
+  return [localTimeZone name];
+}
+
+#if !TARGET_OS_TV
++ (id<FBResponsePayload>)handleGetSimulatedLocation:(FBRouteRequest *)request
+{
+  NSError *error;
+  CLLocation *location = [XCUIDevice.sharedDevice fb_getSimulatedLocation:&error];
+  if (nil != error) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description traceback:nil]);
+  }
+  return FBResponseWithObject(@{
+    @"latitude": location ? @(location.coordinate.latitude) : NSNull.null,
+    @"longitude": location ? @(location.coordinate.longitude) : NSNull.null,
+    @"altitude": location ? @(location.altitude) : NSNull.null,
+  });
+}
+
++ (id<FBResponsePayload>)handleSetSimulatedLocation:(FBRouteRequest *)request
+{
+  NSNumber *longitude = request.arguments[@"longitude"];
+  NSNumber *latitude = request.arguments[@"latitude"];
+
+  if (nil == longitude || nil == latitude) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Both latitude and longitude must be provided" traceback:nil]);
+  }
+  NSError *error;
+  CLLocation *location = [[CLLocation alloc] initWithLatitude:latitude.doubleValue longitude:longitude.doubleValue];
+  if (![XCUIDevice.sharedDevice fb_setSimulatedLocation:location error:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
++ (id<FBResponsePayload>)handleClearSimulatedLocation:(FBRouteRequest *)request
+{
+  NSError *error;
+  if (![XCUIDevice.sharedDevice fb_clearSimulatedLocation:&error]) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description traceback:nil]);
+  }
+  return FBResponseWithOK();
+}
+
+#if __clang_major__ >= 15
++ (id<FBResponsePayload>)handleKeyboardInput:(FBRouteRequest *)request
+{
+  FBElementCache *elementCache = request.session.elementCache;
+  BOOL hasElement = ![request.parameters[@"uuid"] isEqual:@"0"];
+  XCUIElement *destination = hasElement
+    ? [elementCache elementForUUID:(NSString *)request.parameters[@"uuid"] checkStaleness:YES]
+    : request.session.activeApplication;
+  id keys = request.arguments[@"keys"];
+
+  if (![destination respondsToSelector:@selector(typeKey:modifierFlags:)]) {
+    return FBResponseWithStatus([FBCommandStatus unsupportedOperationErrorWithMessage:@"typeKey API is only supported since Xcode15 and iPadOS 17" traceback:nil]);
+  }
+
+  if (![keys isKindOfClass:NSArray.class]) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"The 'keys' argument must be an array" traceback:nil]);
+  }
+  for (id item in (NSArray *)keys) {
+    if ([item isKindOfClass:NSString.class]) {
+      NSString *keyValue = [FBKeyboard keyValueForName:item] ?: item;
+      [destination typeKey:keyValue modifierFlags:XCUIKeyModifierNone];
+    } else if ([item isKindOfClass:NSDictionary.class]) {
+      id key = [(NSDictionary *)item objectForKey:@"key"];
+      if (![key isKindOfClass:NSString.class]) {
+        return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"All dictionaries must have 'key' of type string" traceback:nil]);
+      }
+      id modifiers = [(NSDictionary *)item objectForKey:@"modifierFlags"];
+      NSUInteger modifierFlags = XCUIKeyModifierNone;
+      if ([modifiers isKindOfClass:NSNumber.class]) {
+        modifierFlags = [(NSNumber *)modifiers unsignedIntValue];
+      }
+      NSString *keyValue = [FBKeyboard keyValueForName:item] ?: key;
+      [destination typeKey:keyValue modifierFlags:modifierFlags];
+    } else {
+      return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"All items must be dictionaries or strings" traceback:nil]);
+    }
+  }
+  return FBResponseWithOK();
+}
+#endif
+
++ (id<FBResponsePayload>)handleMediaImport:(FBRouteRequest *)request
+{
+  NSString *albumName = request.arguments[@"album"];
+  NSString *dataBase64 = request.arguments[@"dataBase64"];
+  NSNumber *creationTimestampMs = request.arguments[@"creationTimestampMs"];
+  
+  BOOL useAlbum = (albumName != nil && albumName.length > 0);
+  
+  if (nil == dataBase64) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'dataBase64' argument is required" traceback:nil]);
+  }
+  
+  NSData *imageData = [[NSData alloc] initWithBase64EncodedString:dataBase64 options:0];
+  if (nil == imageData) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot decode base64 image data" traceback:nil]);
+  }
+  
+  UIImage *image = [UIImage imageWithData:imageData];
+  if (nil == image) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"Cannot create image from provided data" traceback:nil]);
+  }
+  
+  __block NSError *blockError = nil;
+  __block NSString *assetLocalIdentifier = nil;
+  
+  PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
+  if (status == PHAuthorizationStatusNotDetermined) {
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus newStatus) {
+      dispatch_semaphore_signal(sema);
+    }];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    status = [PHPhotoLibrary authorizationStatus];
+  }
+  
+  if (status != PHAuthorizationStatusAuthorized) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Photo library access not authorized" traceback:nil]);
+  }
+  
+  [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+    PHAssetCreationRequest *creationRequest = [PHAssetCreationRequest creationRequestForAssetFromImage:image];
+    if (creationTimestampMs != nil) {
+      NSDate *creationDate = [NSDate dateWithTimeIntervalSince1970:(creationTimestampMs.doubleValue / 1000.0)];
+      creationRequest.creationDate = creationDate;
+    }
+    assetLocalIdentifier = creationRequest.placeholderForCreatedAsset.localIdentifier;
+  } error:&blockError];
+  
+  if (blockError != nil) {
+    return FBResponseWithUnknownError(blockError);
+  }
+  
+  if (useAlbum) {
+    __block PHAssetCollection *album = nil;
+    PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+    fetchOptions.predicate = [NSPredicate predicateWithFormat:@"title = %@", albumName];
+    PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                                                               subtype:PHAssetCollectionSubtypeAny
+                                                                                               options:fetchOptions];
+    album = collections.firstObject;
+    
+    if (nil == album) {
+      [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+        [PHAssetCollectionChangeRequest creationRequestForAssetCollectionWithTitle:albumName];
+      } error:&blockError];
+      
+      if (blockError != nil) {
+        return FBResponseWithUnknownError(blockError);
+      }
+      
+      collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                             subtype:PHAssetCollectionSubtypeAny
+                                                             options:fetchOptions];
+      album = collections.firstObject;
+    }
+    
+    if (nil == album) {
+      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to create or find album" traceback:nil]);
+    }
+    
+    PHFetchResult<PHAsset *> *assets = [PHAsset fetchAssetsWithLocalIdentifiers:@[assetLocalIdentifier] options:nil];
+    PHAsset *asset = assets.firstObject;
+    
+    if (nil == asset) {
+      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Failed to fetch created asset" traceback:nil]);
+    }
+    
+    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+      PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
+      [albumChangeRequest addAssets:@[asset]];
+    } error:&blockError];
+    
+    if (blockError != nil) {
+      return FBResponseWithUnknownError(blockError);
+    }
+  }
+  
+  return FBResponseWithOK();
+}
+
++ (BOOL)handleDeleteConfirmationDialogWithTimeout:(NSTimeInterval)timeout
+{
+  XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
+  
+  NSArray<NSString *> *deleteButtonLabels = @[
+    @"Delete", @"Delete Photo", @"Delete Photos", @"Delete Items", @"Delete Item",
+    @"Delete Video", @"Delete Videos",
+    @"Удалить", @"Supprimer", @"Löschen", @"Eliminar", @"删除", @"刪除", @"削除", @"삭제"
+  ];
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    for (NSString *label in deleteButtonLabels) {
+      XCUIElement *deleteButton = springboard.buttons[label];
+      if (deleteButton.exists && deleteButton.isHittable) {
+        [deleteButton tap];
+        return YES;
+      }
+    }
+    
+    XCUIElementQuery *alerts = springboard.alerts;
+    if (alerts.count > 0) {
+      XCUIElement *alert = [alerts elementBoundByIndex:0];
+      XCUIElementQuery *alertButtons = alert.buttons;
+      
+      for (NSUInteger i = 0; i < alertButtons.count; i++) {
+        XCUIElement *button = [alertButtons elementBoundByIndex:i];
+        NSString *buttonLabel = button.label;
+        
+        if (buttonLabel == nil) continue;
+        
+        NSString *lowerLabel = [buttonLabel lowercaseString];
+        if ([lowerLabel containsString:@"delete"] || [lowerLabel containsString:@"remove"]) {
+          if (button.exists && button.isHittable) {
+            [button tap];
+            return YES;
+          }
+        }
+      }
+    }
+    
+    [NSThread sleepForTimeInterval:0.1];
+  }
+  
+  return NO;
+}
+
++ (id<FBResponsePayload>)handleMediaPop:(FBRouteRequest *)request
+{
+  NSString *albumName = request.arguments[@"album"];
+  NSNumber *count = request.arguments[@"count"] ?: @1;
+  
+  BOOL deleteFromLibrary = (albumName == nil || albumName.length == 0);
+  
+  if (count.integerValue < 1) {
+    return FBResponseWithStatus([FBCommandStatus invalidArgumentErrorWithMessage:@"'count' must be at least 1" traceback:nil]);
+  }
+  
+  PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
+  if (status != PHAuthorizationStatusAuthorized) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Photo library access not authorized" traceback:nil]);
+  }
+  
+  PHFetchResult<PHAsset *> *assets = nil;
+  PHAssetCollection *album = nil;
+  
+  if (deleteFromLibrary) {
+    PHFetchOptions *assetFetchOptions = [[PHFetchOptions alloc] init];
+    assetFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:YES]];
+    assets = [PHAsset fetchAssetsWithOptions:assetFetchOptions];
+  } else {
+    PHFetchOptions *fetchOptions = [[PHFetchOptions alloc] init];
+    fetchOptions.predicate = [NSPredicate predicateWithFormat:@"title = %@", albumName];
+    PHFetchResult<PHAssetCollection *> *collections = [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeAlbum
+                                                                                               subtype:PHAssetCollectionSubtypeAny
+                                                                                               options:fetchOptions];
+    album = collections.firstObject;
+    
+    if (nil == album) {
+      return FBResponseWithOK();
+    }
+    
+    PHFetchOptions *assetFetchOptions = [[PHFetchOptions alloc] init];
+    assetFetchOptions.sortDescriptors = @[[NSSortDescriptor sortDescriptorWithKey:@"creationDate" ascending:YES]];
+    assets = [PHAsset fetchAssetsInAssetCollection:album options:assetFetchOptions];
+  }
+  
+  NSInteger actualCount = MIN(count.integerValue, (NSInteger)assets.count);
+  if (actualCount == 0) {
+    return FBResponseWithOK();
+  }
+  
+  NSMutableArray<PHAsset *> *assetsToProcess = [NSMutableArray arrayWithCapacity:actualCount];
+  for (NSInteger i = 0; i < actualCount; i++) {
+    [assetsToProcess addObject:[assets objectAtIndex:i]];
+  }
+  
+  __block NSError *blockError = nil;
+  
+  if (deleteFromLibrary) {
+    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
+    __block BOOL operationCompleted = NO;
+    
+    [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+      [PHAssetChangeRequest deleteAssets:assetsToProcess];
+    } completionHandler:^(BOOL success, NSError *error) {
+      if (!success && error != nil) {
+        blockError = error;
+      }
+      operationCompleted = YES;
+      dispatch_semaphore_signal(semaphore);
+    }];
+    
+    [NSThread sleepForTimeInterval:0.5];
+    [self handleDeleteConfirmationDialogWithTimeout:5.0];
+    
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC);
+    dispatch_semaphore_wait(semaphore, timeout);
+    
+    if (!operationCompleted) {
+      return FBResponseWithStatus([FBCommandStatus timeoutErrorWithMessage:@"Delete operation timed out" traceback:nil]);
+    }
+  } else {
+    [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
+      PHAssetCollectionChangeRequest *albumChangeRequest = [PHAssetCollectionChangeRequest changeRequestForAssetCollection:album];
+      [albumChangeRequest removeAssets:assetsToProcess];
+    } error:&blockError];
+  }
+  
+  if (blockError != nil) {
+    return FBResponseWithUnknownError(blockError);
+  }
+  
+  return FBResponseWithOK();
+}
+#endif
+
++ (id<FBResponsePayload>)handlePerformAccessibilityAudit:(FBRouteRequest *)request
+{
+  NSError *error;
+  NSArray *requestedTypes = request.arguments[@"auditTypes"];
+  NSMutableSet *typesSet = [NSMutableSet set];
+  if (nil == requestedTypes || 0 == [requestedTypes count]) {
+    [typesSet addObject:@"XCUIAccessibilityAuditTypeAll"];
+  } else {
+    [typesSet addObjectsFromArray:requestedTypes];
+  }
+  NSArray *result = [request.session.activeApplication fb_performAccessibilityAuditWithAuditTypesSet:typesSet.copy error:&error];
+  if (nil == result) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:error.description traceback:nil]);
+  }
+  return FBResponseWithObject(result);
+}
+
+@end
