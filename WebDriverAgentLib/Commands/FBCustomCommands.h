@@ -17,10 +17,6 @@ NS_ASSUME_NONNULL_BEGIN
 + (id<FBResponsePayload>)handleMediaImport:(FBRouteRequest *)request;
 + (id<FBResponsePayload>)handleMediaPop:(FBRouteRequest *)request;
 
-// Script execution
-+ (id<FBResponsePayload>)handleScript:(FBRouteRequest *)request;
-+ (id<FBResponsePayload>)handleScriptStream:(FBRouteRequest *)request;
-
 @end
 
 NS_ASSUME_NONNULL_END
