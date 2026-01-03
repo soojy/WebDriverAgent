@@ -618,6 +618,333 @@
 #endif
 
 /**
+ * Helper method to handle Photos permission dialog and tap "Allow Full Access"
+ */
++ (BOOL)handlePhotosPermissionDialogWithTimeout:(NSTimeInterval)timeout
+{
+  XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
+  
+  NSArray<NSString *> *fullAccessLabels = @[
+    @"Allow Full Access",
+    @"Allow Access to All Photos",
+    @"Full Access",
+    @"Полный доступ",
+    @"Autoriser l'accès complet",
+    @"Vollzugriff erlauben",
+    @"Permitir acceso completo",
+    @"允许完全访问",
+    @"允許完整取用",
+    @"フルアクセスを許可",
+    @"전체 접근 허용"
+  ];
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    // Check alerts
+    XCUIElementQuery *alerts = springboard.alerts;
+    if (alerts.count > 0) {
+      XCUIElement *alert = [alerts elementBoundByIndex:0];
+      XCUIElementQuery *alertButtons = alert.buttons;
+      
+      // Try exact matches first
+      for (NSString *label in fullAccessLabels) {
+        XCUIElement *button = alertButtons[label];
+        if (button.exists && button.isHittable) {
+          [button tap];
+          [NSThread sleepForTimeInterval:0.3];
+          // Verify modal closed
+          if (![self isModalPresentOnSpringboard:springboard]) {
+            return YES;
+          }
+          // Try tapping again if still visible
+          if (button.exists && button.isHittable) {
+            [button tap];
+            [NSThread sleepForTimeInterval:0.3];
+          }
+          if (![self isModalPresentOnSpringboard:springboard]) {
+            return YES;
+          }
+        }
+      }
+      
+      // Try partial match
+      for (NSUInteger i = 0; i < alertButtons.count; i++) {
+        XCUIElement *button = [alertButtons elementBoundByIndex:i];
+        NSString *buttonLabel = button.label;
+        
+        if (buttonLabel == nil) {
+          continue;
+        }
+        
+        NSString *lowerLabel = [buttonLabel lowercaseString];
+        if ([lowerLabel containsString:@"full access"] ||
+            [lowerLabel containsString:@"all photos"] ||
+            [lowerLabel containsString:@"vollzugriff"] ||
+            [lowerLabel containsString:@"accès complet"]) {
+          if (button.exists && button.isHittable) {
+            [button tap];
+            [NSThread sleepForTimeInterval:0.3];
+            if (![self isModalPresentOnSpringboard:springboard]) {
+              return YES;
+            }
+          }
+        }
+      }
+    }
+    
+    [NSThread sleepForTimeInterval:0.1];
+  }
+  
+  return NO;
+}
+
+/**
+ * Helper to check if modal is present on springboard
+ */
++ (BOOL)isModalPresentOnSpringboard:(XCUIApplication *)springboard
+{
+  return springboard.alerts.count > 0 || springboard.sheets.count > 0;
+}
+
+/**
+ * Helper method to wait for modal to be dismissed
+ */
++ (BOOL)waitForModalToDismissWithTimeout:(NSTimeInterval)timeout
+{
+  XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    if (![self isModalPresentOnSpringboard:springboard]) {
+      return YES;
+    }
+    [NSThread sleepForTimeInterval:0.1];
+  }
+  
+  return ![self isModalPresentOnSpringboard:springboard];
+}
+
+/**
+ * Helper method to find and tap the delete confirmation button in system alerts
+ * Returns YES if button was tapped and modal was dismissed
+ */
++ (BOOL)handleDeleteConfirmationDialogWithTimeout:(NSTimeInterval)timeout
+{
+  XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
+  
+  // List of possible delete button labels (for different iOS versions and localizations)
+  NSArray<NSString *> *deleteButtonLabels = @[
+    @"Delete",
+    @"Delete Photo",
+    @"Delete Photos",
+    @"Delete Items",
+    @"Delete Item",
+    @"Delete Video",
+    @"Delete Videos",
+    @"Удалить",
+    @"Supprimer",
+    @"Löschen",
+    @"Eliminar",
+    @"删除",
+    @"刪除",
+    @"削除",
+    @"삭제"
+  ];
+  
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  
+  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
+    BOOL tappedButton = NO;
+    
+    // First, try to find buttons directly in springboard
+    for (NSString *label in deleteButtonLabels) {
+      XCUIElement *deleteButton = springboard.buttons[label];
+      if (deleteButton.exists && deleteButton.isHittable) {
+        [deleteButton tap];
+        tappedButton = YES;
+        [NSThread sleepForTimeInterval:0.3];
+        
+        // Verify modal is closed
+        if (![self isModalPresentOnSpringboard:springboard]) {
+          return YES;
+        }
+        
+        // Modal still there, try tapping again
+        if (deleteButton.exists && deleteButton.isHittable) {
+          [deleteButton tap];
+          [NSThread sleepForTimeInterval:0.3];
+          if (![self isModalPresentOnSpringboard:springboard]) {
+            return YES;
+          }
+        }
+      }
+    }
+    
+    // Try to find buttons in alerts
+    XCUIElementQuery *alerts = springboard.alerts;
+    if (alerts.count > 0) {
+      XCUIElement *alert = [alerts elementBoundByIndex:0];
+      XCUIElementQuery *alertButtons = alert.buttons;
+      
+      for (NSUInteger i = 0; i < alertButtons.count; i++) {
+        XCUIElement *button = [alertButtons elementBoundByIndex:i];
+        NSString *buttonLabel = button.label;
+        
+        if (buttonLabel == nil) {
+          continue;
+        }
+        
+        // Check if it's a delete-related button
+        NSString *lowerLabel = [buttonLabel lowercaseString];
+        if ([lowerLabel containsString:@"delete"] ||
+            [lowerLabel containsString:@"remove"] ||
+            [lowerLabel containsString:@"удалить"] ||
+            [lowerLabel containsString:@"supprimer"] ||
+            [lowerLabel containsString:@"löschen"] ||
+            [lowerLabel containsString:@"eliminar"]) {
+          if (button.exists && button.isHittable) {
+            [button tap];
+            tappedButton = YES;
+            [NSThread sleepForTimeInterval:0.3];
+            
+            // Check if alert is gone
+            if (![self isModalPresentOnSpringboard:springboard]) {
+              return YES;
+            }
+            
+            // Try again if still visible
+            if (button.exists && button.isHittable) {
+              [button tap];
+              [NSThread sleepForTimeInterval:0.3];
+              if (![self isModalPresentOnSpringboard:springboard]) {
+                return YES;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // Also check for sheets (action sheets)
+    XCUIElementQuery *sheets = springboard.sheets;
+    if (sheets.count > 0) {
+      XCUIElement *sheet = [sheets elementBoundByIndex:0];
+      XCUIElementQuery *sheetButtons = sheet.buttons;
+      
+      for (NSUInteger i = 0; i < sheetButtons.count; i++) {
+        XCUIElement *button = [sheetButtons elementBoundByIndex:i];
+        NSString *buttonLabel = button.label;
+        
+        if (buttonLabel == nil) {
+          continue;
+        }
+        
+        NSString *lowerLabel = [buttonLabel lowercaseString];
+        if ([lowerLabel containsString:@"delete"] ||
+            [lowerLabel containsString:@"remove"]) {
+          if (button.exists && button.isHittable) {
+            [button tap];
+            tappedButton = YES;
+            [NSThread sleepForTimeInterval:0.3];
+            
+            if (![self isModalPresentOnSpringboard:springboard]) {
+              return YES;
+            }
+            
+            // Retry tap if still visible
+            if (button.exists && button.isHittable) {
+              [button tap];
+              [NSThread sleepForTimeInterval:0.3];
+              if (![self isModalPresentOnSpringboard:springboard]) {
+                return YES;
+              }
+            }
+          }
+        }
+      }
+    }
+    
+    // If we tapped but modal didn't close, wait a bit more and retry
+    if (tappedButton) {
+      [NSThread sleepForTimeInterval:0.3];
+    }
+    
+    [NSThread sleepForTimeInterval:0.1];
+  }
+  
+  return NO;
+}
+
+/**
+ * Helper to handle any modal dialogs with retries
+ */
++ (void)handleModalDialogsWithMaxRetries:(int)maxRetries
+{
+  for (int retry = 0; retry < maxRetries; retry++) {
+    XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
+    
+    if (![self isModalPresentOnSpringboard:springboard]) {
+      break;
+    }
+    
+    [self handleDeleteConfirmationDialogWithTimeout:2.0];
+    [NSThread sleepForTimeInterval:0.5];
+  }
+}
+
+/**
+ * Request photo library authorization with proper handling for iOS 14+
+ */
++ (PHAuthorizationStatus)requestPhotoLibraryAuthorizationWithFullAccess
+{
+  __block PHAuthorizationStatus status;
+  
+  if (@available(iOS 14, *)) {
+    status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+    
+    if (status == PHAuthorizationStatusNotDetermined) {
+      dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+      [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelReadWrite handler:^(PHAuthorizationStatus newStatus) {
+        status = newStatus;
+        dispatch_semaphore_signal(sema);
+      }];
+      
+      // Wait a moment for the dialog to appear
+      [NSThread sleepForTimeInterval:0.5];
+      
+      // Try to handle "Allow Full Access" button
+      [self handlePhotosPermissionDialogWithTimeout:3.0];
+      
+      dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+      status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+    }
+    
+    // If limited access, try to get full access
+    if (status == PHAuthorizationStatusLimited) {
+      // Try to handle any pending permission dialog
+      [self handlePhotosPermissionDialogWithTimeout:2.0];
+      status = [PHPhotoLibrary authorizationStatusForAccessLevel:PHAccessLevelReadWrite];
+    }
+  } else {
+    status = [PHPhotoLibrary authorizationStatus];
+    
+    if (status == PHAuthorizationStatusNotDetermined) {
+      dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+      [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus newStatus) {
+        status = newStatus;
+        dispatch_semaphore_signal(sema);
+      }];
+      dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+      status = [PHPhotoLibrary authorizationStatus];
+    }
+  }
+  
+  return status;
+}
+
+/**
  * Import media to photo library.
  * If 'album' is provided and non-empty, the asset is also added to that album.
  * If 'album' is nil or empty, the asset is only added to the library (appears in Recents automatically).
@@ -651,20 +978,22 @@
   __block NSError *blockError = nil;
   __block NSString *assetLocalIdentifier = nil;
   
-  // Request authorization if needed
-  PHAuthorizationStatus status = [PHPhotoLibrary authorizationStatus];
-  if (status == PHAuthorizationStatusNotDetermined) {
-    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-    [PHPhotoLibrary requestAuthorization:^(PHAuthorizationStatus newStatus) {
-      dispatch_semaphore_signal(sema);
-    }];
-    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
-    status = [PHPhotoLibrary authorizationStatus];
-  }
+  // Request authorization with full access handling
+  PHAuthorizationStatus status = [self requestPhotoLibraryAuthorizationWithFullAccess];
   
-  if (status != PHAuthorizationStatusAuthorized) {
-    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Photo library access not authorized"
-                                                               traceback:nil]);
+  if (@available(iOS 14, *)) {
+    if (status != PHAuthorizationStatusAuthorized) {
+      NSString *errorMsg = (status == PHAuthorizationStatusLimited)
+        ? @"Photo library has limited access. Please grant 'Allow Full Access' permission in Settings > Privacy > Photos."
+        : @"Photo library access not authorized";
+      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:errorMsg
+                                                                 traceback:nil]);
+    }
+  } else {
+    if (status != PHAuthorizationStatusAuthorized) {
+      return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"Photo library access not authorized"
+                                                                 traceback:nil]);
+    }
   }
   
   // Create the asset - it will automatically appear in Recents/All Photos
@@ -735,109 +1064,9 @@
 }
 
 /**
- * Helper method to find and tap the delete confirmation button in system alerts
- */
-+ (BOOL)handleDeleteConfirmationDialogWithTimeout:(NSTimeInterval)timeout
-{
-  XCUIApplication *springboard = [[XCUIApplication alloc] initWithBundleIdentifier:@"com.apple.springboard"];
-  
-  // List of possible delete button labels (for different iOS versions and localizations)
-  NSArray<NSString *> *deleteButtonLabels = @[
-    @"Delete",
-    @"Delete Photo",
-    @"Delete Photos",
-    @"Delete Items",
-    @"Delete Item",
-    @"Delete Video",
-    @"Delete Videos",
-    @"Удалить",           // Russian
-    @"Supprimer",         // French
-    @"Löschen",           // German
-    @"Eliminar",          // Spanish
-    @"删除",              // Chinese Simplified
-    @"刪除",              // Chinese Traditional
-    @"削除",              // Japanese
-    @"삭제"               // Korean
-  ];
-  
-  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
-  
-  while ([[NSDate date] compare:deadline] == NSOrderedAscending) {
-    // First, try to find buttons directly in springboard
-    for (NSString *label in deleteButtonLabels) {
-      XCUIElement *deleteButton = springboard.buttons[label];
-      if (deleteButton.exists && deleteButton.isHittable) {
-        [deleteButton tap];
-        return YES;
-      }
-    }
-    
-    // Try to find buttons in alerts
-    XCUIElementQuery *alerts = springboard.alerts;
-    if (alerts.count > 0) {
-      XCUIElement *alert = [alerts elementBoundByIndex:0];
-      XCUIElementQuery *alertButtons = alert.buttons;
-      
-      for (NSUInteger i = 0; i < alertButtons.count; i++) {
-        XCUIElement *button = [alertButtons elementBoundByIndex:i];
-        NSString *buttonLabel = button.label;
-        
-        if (buttonLabel == nil) {
-          continue;
-        }
-        
-        // Check if it's a delete-related button
-        NSString *lowerLabel = [buttonLabel lowercaseString];
-        if ([lowerLabel containsString:@"delete"] ||
-            [lowerLabel containsString:@"remove"] ||
-            [lowerLabel containsString:@"удалить"] ||
-            [lowerLabel containsString:@"supprimer"] ||
-            [lowerLabel containsString:@"löschen"] ||
-            [lowerLabel containsString:@"eliminar"]) {
-          if (button.exists && button.isHittable) {
-            [button tap];
-            return YES;
-          }
-        }
-      }
-    }
-    
-    // Also check for sheets (action sheets)
-    XCUIElementQuery *sheets = springboard.sheets;
-    if (sheets.count > 0) {
-      XCUIElement *sheet = [sheets elementBoundByIndex:0];
-      XCUIElementQuery *sheetButtons = sheet.buttons;
-      
-      for (NSUInteger i = 0; i < sheetButtons.count; i++) {
-        XCUIElement *button = [sheetButtons elementBoundByIndex:i];
-        NSString *buttonLabel = button.label;
-        
-        if (buttonLabel == nil) {
-          continue;
-        }
-        
-        NSString *lowerLabel = [buttonLabel lowercaseString];
-        if ([lowerLabel containsString:@"delete"] ||
-            [lowerLabel containsString:@"remove"]) {
-          if (button.exists && button.isHittable) {
-            [button tap];
-            return YES;
-          }
-        }
-      }
-    }
-    
-    // Small delay before retrying
-    [NSThread sleepForTimeInterval:0.1];
-  }
-  
-  return NO;
-}
-
-/**
- * Delete media from photo library.
+ * Delete media from photo library permanently.
  * If 'album' is provided and non-empty, removes assets from that specific album only.
- * If 'album' is nil or empty, DELETES assets from the entire photo library.
+ * If 'album' is nil or empty, PERMANENTLY DELETES assets from the photo library.
  */
 + (id<FBResponsePayload>)handleMediaPop:(FBRouteRequest *)request
 {
@@ -890,21 +1119,22 @@
     return FBResponseWithOK();
   }
   
+  // Collect asset identifiers before deletion
+  NSMutableArray<NSString *> *assetIdentifiers = [NSMutableArray arrayWithCapacity:actualCount];
   NSMutableArray<PHAsset *> *assetsToProcess = [NSMutableArray arrayWithCapacity:actualCount];
   for (NSInteger i = 0; i < actualCount; i++) {
-    [assetsToProcess addObject:[assets objectAtIndex:i]];
+    PHAsset *asset = [assets objectAtIndex:i];
+    [assetsToProcess addObject:asset];
+    [assetIdentifiers addObject:asset.localIdentifier];
   }
   
   __block NSError *blockError = nil;
   
   if (deleteFromLibrary) {
-    // DELETE assets from library entirely (moves to Recently Deleted)
-    // This triggers a system confirmation dialog that we need to handle
-    
+    // Step 1: DELETE assets from library (moves to Recently Deleted)
     dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
     __block BOOL operationCompleted = NO;
     
-    // Start the delete operation asynchronously
     [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
       [PHAssetChangeRequest deleteAssets:assetsToProcess];
     } completionHandler:^(BOOL success, NSError *error) {
@@ -915,14 +1145,24 @@
       dispatch_semaphore_signal(semaphore);
     }];
     
-    // Handle the system confirmation dialog
-    // Give the dialog a moment to appear
+    // Handle the system confirmation dialog with retry logic
     [NSThread sleepForTimeInterval:0.5];
     
-    // Try to find and tap the delete button
-    [self handleDeleteConfirmationDialogWithTimeout:5.0];
+    for (int attempt = 0; attempt < 5; attempt++) {
+      BOOL handled = [self handleDeleteConfirmationDialogWithTimeout:3.0];
+      if (handled) {
+        // Verify modal is actually closed
+        if ([self waitForModalToDismissWithTimeout:2.0]) {
+          break;
+        }
+      }
+      [NSThread sleepForTimeInterval:0.3];
+    }
     
-    // Wait for the delete operation to complete (with timeout)
+    // Final cleanup for any remaining modals
+    [self handleModalDialogsWithMaxRetries:3];
+    
+    // Wait for the delete operation to complete
     dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC);
     dispatch_semaphore_wait(semaphore, timeout);
     
@@ -930,6 +1170,67 @@
       return FBResponseWithStatus([FBCommandStatus timeoutErrorWithMessage:@"Delete operation timed out"
                                                                  traceback:nil]);
     }
+    
+    if (blockError != nil) {
+      return FBResponseWithUnknownError(blockError);
+    }
+    
+    // Step 2: Permanently delete from Recently Deleted
+    [NSThread sleepForTimeInterval:1.0];
+    
+    // Fetch from Recently Deleted smart album
+    PHFetchResult<PHAssetCollection *> *recentlyDeletedAlbums =
+      [PHAssetCollection fetchAssetCollectionsWithType:PHAssetCollectionTypeSmartAlbum
+                                               subtype:PHAssetCollectionSubtypeSmartAlbumRecentlyDeleted
+                                               options:nil];
+    
+    PHAssetCollection *recentlyDeletedAlbum = recentlyDeletedAlbums.firstObject;
+    
+    if (recentlyDeletedAlbum != nil) {
+      // Fetch all assets in Recently Deleted and filter by our identifiers
+      PHFetchResult<PHAsset *> *allRecentlyDeleted = [PHAsset fetchAssetsInAssetCollection:recentlyDeletedAlbum options:nil];
+      
+      NSSet<NSString *> *identifiersSet = [NSSet setWithArray:assetIdentifiers];
+      NSMutableArray<PHAsset *> *assetsToDeletePermanently = [NSMutableArray array];
+      
+      [allRecentlyDeleted enumerateObjectsUsingBlock:^(PHAsset *asset, NSUInteger idx, BOOL *stop) {
+        if ([identifiersSet containsObject:asset.localIdentifier]) {
+          [assetsToDeletePermanently addObject:asset];
+        }
+      }];
+      
+      if (assetsToDeletePermanently.count > 0) {
+        dispatch_semaphore_t semaphore2 = dispatch_semaphore_create(0);
+        __block BOOL permanentDeleteCompleted = NO;
+        
+        [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+          [PHAssetChangeRequest deleteAssets:assetsToDeletePermanently];
+        } completionHandler:^(BOOL success, NSError *error) {
+          permanentDeleteCompleted = YES;
+          dispatch_semaphore_signal(semaphore2);
+        }];
+        
+        // Handle the permanent delete confirmation dialog
+        [NSThread sleepForTimeInterval:0.5];
+        
+        for (int attempt = 0; attempt < 5; attempt++) {
+          BOOL handled = [self handleDeleteConfirmationDialogWithTimeout:3.0];
+          if (handled) {
+            if ([self waitForModalToDismissWithTimeout:2.0]) {
+              break;
+            }
+          }
+          [NSThread sleepForTimeInterval:0.3];
+        }
+        
+        // Final cleanup
+        [self handleModalDialogsWithMaxRetries:3];
+        
+        dispatch_time_t timeout2 = dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC);
+        dispatch_semaphore_wait(semaphore2, timeout2);
+      }
+    }
+    
   } else {
     // Just remove from album (asset stays in library) - no confirmation needed
     [[PHPhotoLibrary sharedPhotoLibrary] performChangesAndWait:^{
